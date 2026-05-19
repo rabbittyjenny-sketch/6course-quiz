@@ -24,6 +24,12 @@ import {
 // ============================================================
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwYnuFfq6E3GsU0fYznj9jrdM6hl3736ET1i3k4iZGCK5-2fyRTjF9ANHaAYdtIgV6XJQ/exec";
 
+// Supabase enrollment endpoint (primary source — Google Apps Script is fallback)
+const SUPABASE_ENROLL_URL = import.meta.env.VITE_SUPABASE_URL
+  ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/get-enrollment`
+  : null;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+
 const IMG = {
   favicon: "https://ik.imagekit.io/ideas365logo/creatr365_favicon.png?updatedAt=1778430978942",
   center: "https://ik.imagekit.io/ideas365logo/creatr365_center.png?updatedAt=1778430978987",
@@ -362,14 +368,42 @@ function LoginScreen({ onLogin }) {
       return;
     }
     setLoading(true); setErr("");
-    const data = await apiGetStudent(id);
-    const enroll = await apiGetEnroll(id);
-    // Demo mode: all courses enrolled if API not configured
-    const courses = enroll?.courses?.length ? enroll.courses : Object.keys(COURSES);
-    onLogin(
-      { id, name: data?.display_name || "นักเรียน" },
-      courses
-    );
+
+    let displayName = "นักเรียน";
+    let courses = [];
+
+    // 1. ดึง enrollment จาก Supabase (primary)
+    if (SUPABASE_ENROLL_URL) {
+      try {
+        const res = await fetch(SUPABASE_ENROLL_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY },
+          body: JSON.stringify({ student_id: id }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.courses?.length) courses = data.courses;
+          if (data.display_name) displayName = data.display_name;
+        }
+      } catch(_) { /* fallback to Apps Script */ }
+    }
+
+    // 2. Fallback: Google Apps Script (ถ้า Supabase ไม่มีข้อมูล)
+    if (!courses.length) {
+      const gsData = await apiGetStudent(id);
+      const gsEnroll = await apiGetEnroll(id);
+      if (gsEnroll?.courses?.length) courses = gsEnroll.courses;
+      if (gsData?.display_name) displayName = gsData.display_name;
+    }
+
+    // 3. ยังไม่มีคอร์ส → แจ้ง ไม่ให้เข้า
+    if (!courses.length) {
+      setErr("ยังไม่มีคอร์สที่ลงทะเบียน — กรุณาติดต่อทีมงาน Creatr365 ผ่าน LINE OA");
+      setLoading(false);
+      return;
+    }
+
+    onLogin({ id, name: displayName }, courses);
     setLoading(false);
   }
 
