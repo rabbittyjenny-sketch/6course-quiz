@@ -431,23 +431,34 @@ function LoginScreen({ onLogin }) {
 
 // ── Dashboard ────────────────────────────────────────────────
 function Dashboard({ student, enrolledCourses, courseProgress, onSelect }) {
-  const allCourses = Object.values(COURSES);
+  // Show only purchased courses, sorted by level (COURSE_ORDER)
+  const allCourses = COURSE_ORDER
+    .filter(id => enrolledCourses.includes(id))
+    .map(id => COURSES[id])
+    .filter(Boolean);
+
   return (
     <div style={S.wrap}>
       <div style={{ padding:"22px 0 14px" }}>
         <div style={S.h1}>สวัสดี, {student.name}</div>
-        <div style={S.muted}>คอร์สของฉัน · {enrolledCourses.length} คอร์ส</div>
+        <div style={S.muted}>คอร์สของฉัน · {allCourses.length} คอร์ส</div>
       </div>
 
+      {allCourses.length === 0 && (
+        <div style={{ ...S.card, textAlign:"center", color:"#888", padding:"36px 20px" }}>
+          ยังไม่มีคอร์สที่ลงทะเบียน<br/>
+          <span style={{ fontSize:12 }}>กรุณาติดต่อทีม Creatr365 ผ่าน LINE OA</span>
+        </div>
+      )}
+
       {allCourses.map(course => {
-        const enrolled = enrolledCourses.includes(course.id);
         const prog = courseProgress[course.id] || {};
         const done = prog.lessonsCompleted || 0;
         const total = course.lessons.length;
         const pct = total ? Math.round(done/total*100) : 0;
 
         return (
-          <div key={course.id} style={{ ...S.card, opacity:enrolled?1:0.5 }}>
+          <div key={course.id} style={S.card}>
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
               <div style={{ flex:1 }}>
                 <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:4 }}>
@@ -456,17 +467,13 @@ function Dashboard({ student, enrolledCourses, courseProgress, onSelect }) {
                   <span style={S.badgeO}>{course.type==="onsite"?"ONSITE":"ONLINE"}</span>
                 </div>
                 <div style={{ ...S.muted, marginBottom:8 }}>{course.duration} · {course.desc}</div>
-                {enrolled && (
-                  <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-                    <div style={S.barBg}><div style={S.barFill(pct)} /></div>
-                    <span style={{ ...S.muted, whiteSpace:"nowrap" }}>{done}/{total} บท</span>
-                  </div>
-                )}
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <div style={S.barBg}><div style={S.barFill(pct)} /></div>
+                  <span style={{ ...S.muted, whiteSpace:"nowrap" }}>{done}/{total} บท</span>
+                </div>
               </div>
               <div style={{ marginLeft:14 }}>
-                {enrolled
-                  ? <button onClick={()=>onSelect(course.id)} style={S.btnSm}>เข้าเรียน</button>
-                  : <span style={{ ...S.muted, fontSize:12 }}>ยังไม่ได้ซื้อ</span>}
+                <button onClick={()=>onSelect(course.id)} style={S.btnSm}>เข้าเรียน</button>
               </div>
             </div>
           </div>
