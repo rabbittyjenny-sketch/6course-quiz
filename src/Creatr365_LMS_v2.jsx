@@ -275,12 +275,21 @@ function getRecommendations(lessonScores, enrolledCourses = []) {
 // ============================================================
 // 🌐  API CLIENT
 // ============================================================
+const SUPABASE_SAVE_SCORE_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/save-score";
+
 async function api(params) {
   if (!CFG.useApi || APPS_SCRIPT_URL.startsWith("REPLACE")) return null;
   try {
     const url = new URL(APPS_SCRIPT_URL);
     Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
     const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
+    if (params.action === "save_score" && params.sid) {
+      fetch(SUPABASE_SAVE_SCORE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ student_id: params.sid, module_code: params.qg, score: params.pct, passed: params.passed === true || params.passed === "true" }),
+      }).catch(() => {});
+    }
     return JSON.parse(await res.text());
   } catch(e) { console.error("[API]", e); return null; }
 }
@@ -296,34 +305,6 @@ const apiSaveSubmit   = (sid,c,rubric,sub_type,url) =>
   api({ action:"save_submission", sid, course:c, rubric_id:rubric||"", sub_type, url });
 const apiUnlockSession= (sid,c,sr,code) =>
   api({ action:"unlock_session", sid, course:c, session_ref:sr, code });
-
-async function saveModuleScore(studentId, courseId, moduleId, quizType, correct, total, pct, passed) {
-  const supaUrl = import.meta.env.VITE_SUPABASE_URL;
-  const supaKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-  if (!supaUrl || !supaKey || !studentId) return;
-  try {
-    await fetch(`${supaUrl}/rest/v1/quiz_results`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": supaKey,
-        "Authorization": `Bearer ${supaKey}`,
-        "Prefer": "resolution=merge-duplicates",
-      },
-      body: JSON.stringify({
-        student_id: studentId,
-        course_id: courseId,
-        module_id: moduleId,
-        quiz_type: quizType,
-        correct,
-        total,
-        score_pct: pct,
-        passed,
-        completed_at: new Date().toISOString(),
-      }),
-    });
-  } catch(_) {}
-}
 
 // ============================================================
 // 🎨  STYLES — Mono-tone
@@ -389,8 +370,8 @@ function LoginScreen({ onLogin }) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
 
-  async function handle(overrideId) {
-    const id = (overrideId || kid).trim().toUpperCase();
+  async function handle() {
+    const id = kid.trim().toUpperCase();
     if (!id.match(/^STU-\d{3,6}$/i)) {
       setErr("รูปแบบ Key ID ไม่ถูกต้อง — ตัวอย่าง: STU-001");
       return;
@@ -434,17 +415,6 @@ function LoginScreen({ onLogin }) {
     onLogin({ id, name: displayName }, courses);
     setLoading(false);
   }
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlKid = params.get("kid");
-    if (urlKid) {
-      const normalised = urlKid.trim().toUpperCase();
-      setKid(normalised);
-      handle(normalised);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   return (
     <div style={{ ...S.wrap, maxWidth:440, paddingTop:60 }}>
@@ -1074,18 +1044,46 @@ export default function Creatr365LMS() {
   function handleLogin(s, courses) {
     setStudent(s);
     setEnrolledCourses(courses);
-    const params = new URLSearchParams(window.location.search);
-    const urlCourse = params.get("course");
-    if (urlCourse) {
-      const cId = urlCourse.trim().toUpperCase().replace(/-/g, "_");
-      if (courses.includes(cId)) {
-        setActiveCourse(cId);
-        setScreen("course");
-        return;
-      }
-    }
     setScreen("dashboard");
   }
+
+  // Auto-login จาก ?kid=STU-001&course=micro-express ใน URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const kid = params.get("kid")?.trim().toUpperCase();
+    if (!kid) return;
+    (async () => {
+      let displayName = "นักเรียน";
+      let courses = [];
+      if (SUPABASE_ENROLL_URL) {
+        try {
+          const res = await fetch(SUPABASE_ENROLL_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY },
+            body: JSON.stringify({ student_id: kid }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.courses?.length) courses = data.courses;
+            if (data.display_name) displayName = data.display_name;
+          }
+        } catch(_) {}
+      }
+      if (!courses.length) {
+        const gsEnroll = await apiGetEnroll(kid);
+        if (gsEnroll?.courses?.length) courses = gsEnroll.courses;
+      }
+      if (courses.length) {
+        handleLogin({ id: kid, name: displayName }, courses);
+        const course = params.get("course");
+        if (course && courses.includes(course)) {
+          setActiveCourse(course);
+          setScreen("course");
+        }
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function handleLogout() {
     setStudent(null); setEnrolledCourses([]); setCourseProgress({});
@@ -1167,7 +1165,6 @@ export default function Creatr365LMS() {
         return { ...prev, [activeCourse]: { ...cur, "__pretest__": "done" } };
       });
       apiSaveScore(student?.id, activeCourse, "pretest", quizCtx.qg, result.correct, result.total, result.pct, true);
-      saveModuleScore(student?.id, activeCourse, "__pretest__", "pretest", result.correct, result.total, result.pct, true);
       apiSaveProgress(student?.id, activeCourse, "__pretest__", "done");
       setScreen("course");
       return;
@@ -1176,7 +1173,6 @@ export default function Creatr365LMS() {
     // Knowledge Check / Diagnostic
     markLessonDone(activeLesson, result.pct);
     apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, result.pct >= CFG.passThreshold);
-    saveModuleScore(student?.id, activeCourse, activeLesson?.id, quizCtx.quizType, result.correct, result.total, result.pct, result.pct >= CFG.passThreshold);
     setActiveLesson(null);
     setScreen("course");
   }
