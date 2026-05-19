@@ -281,10 +281,18 @@ async function api(params) {
     Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
     const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
     if (params.action === "save_score" && params.sid) {
+      // ส่ง course_slug + qg เพื่อให้ save-score หา module ได้ถูก
+      const courseSlug = String(params.course || "").toLowerCase().replace(/_/g, "-");
       fetch(SUPABASE_SAVE_SCORE_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ student_id: params.sid, module_code: params.qg, score: params.pct, passed: params.passed === true || params.passed === "true" }),
+        body: JSON.stringify({
+          student_id: params.sid,
+          course_slug: courseSlug,
+          module_code: params.qg,
+          score: params.pct,
+          passed: params.passed === true || params.passed === "true",
+        }),
       }).catch(() => {});
     }
     return JSON.parse(await res.text());
@@ -1072,9 +1080,11 @@ export default function Creatr365LMS() {
       }
       if (courses.length) {
         handleLogin({ id: kid, name: displayName }, courses);
-        const course = params.get("course");
-        if (course && courses.includes(course)) {
-          setActiveCourse(course);
+        const courseParam = params.get("course");
+        // slug "micro-express" → "MICRO_EXPRESS" เพื่อ match COURSES key
+        const courseId = courseParam?.toUpperCase().replace(/-/g, "_");
+        if (courseId && courses.includes(courseId)) {
+          setActiveCourse(courseId);
           setScreen("course");
         }
         // ล้าง URL params หลัง login เพื่อไม่ให้ auto-login ซ้ำเมื่อ refresh
