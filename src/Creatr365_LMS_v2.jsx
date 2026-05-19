@@ -24,11 +24,8 @@ import {
 // ============================================================
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwYnuFfq6E3GsU0fYznj9jrdM6hl3736ET1i3k4iZGCK5-2fyRTjF9ANHaAYdtIgV6XJQ/exec";
 
-// Supabase enrollment endpoint (primary source — Google Apps Script is fallback)
-const SUPABASE_ENROLL_URL = import.meta.env.VITE_SUPABASE_URL
-  ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/get-enrollment`
-  : null;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+const SUPABASE_ENROLL_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-enrollment";
+const SUPABASE_ANON_KEY = "sb_publishable_3QLVwjWPu_tp3RckxebHNw_bjJZTUGh";
 
 const IMG = {
   favicon: "https://ik.imagekit.io/ideas365logo/creatr365_favicon.png?updatedAt=1778430978942",
@@ -1080,6 +1077,8 @@ export default function Creatr365LMS() {
           setActiveCourse(course);
           setScreen("course");
         }
+        // ล้าง URL params หลัง login เพื่อไม่ให้ auto-login ซ้ำเมื่อ refresh
+        window.history.replaceState({}, "", window.location.pathname);
       }
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
