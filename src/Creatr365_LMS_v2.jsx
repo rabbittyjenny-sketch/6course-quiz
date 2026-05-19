@@ -302,7 +302,7 @@ async function saveModuleScore(studentId, courseId, moduleId, quizType, correct,
   const supaKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
   if (!supaUrl || !supaKey || !studentId) return;
   try {
-    await fetch(`${supaUrl}/rest/v1/module_progress`, {
+    await fetch(`${supaUrl}/rest/v1/quiz_results`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
