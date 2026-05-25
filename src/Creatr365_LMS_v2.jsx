@@ -292,6 +292,16 @@ async function api(params) {
           score: params.pct,
           passed: params.passed === true || params.passed === "true",
         })
+        // เพิ่ม lessonId param ใน apiSaveScore signature
+    const apiSaveScore = (sid, c, qt, qg, raw, total, pct, passed, lessonId) =>
+    api({ action:"save_score", sid, course:c, quiz_type:qt, qg:qg||"", 
+        raw, total, pct, passed, lesson_id: lessonId||"" });
+
+      // และส่ง activeLessonId เข้าไปตอน call
+    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, 
+             result.correct, result.total, result.pct, 
+             result.pct >= CFG.passThreshold,
+             quizCtx.lessonId)   // ← เพิ่ม
       }).catch(() => {});
     }
     return JSON.parse(await res.text());
