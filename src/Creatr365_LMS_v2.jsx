@@ -285,13 +285,13 @@ async function api(params) {
       fetch(SUPABASE_SAVE_SCORE_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+       body: JSON.stringify({
           student_id: params.sid,
           course_slug: courseSlug,
-          module_code: params.qg,
+          module_code: params.lesson_id || params.qg,  // ← ส่ง M01, S01 ฯลฯ
           score: params.pct,
           passed: params.passed === true || params.passed === "true",
-        }),
+        })
       }).catch(() => {});
     }
     return JSON.parse(await res.text());
