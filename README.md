@@ -1,3 +1,19 @@
+ข้อมูลเก็บที่ไหน:
+
+สมัครสมาชิกใหม่: auth.users
+profile จาก trigger: profiles
+student id / line mapping: user_accounts
+คอร์ส: courses
+บทเรียน: course_modules
+การลงทะเบียนเรียน: course_enrollments
+คะแนน/ความคืบหน้าจาก LMS: module_progress
+งานส่ง: assignments
+
+
+
+
+
+
 # React + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
