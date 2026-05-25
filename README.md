@@ -1,3 +1,16 @@
+SQL Seed v2
+สร้างไฟล์นี้แล้ว: creatr365_seed_v2.sql
+ในไฟล์นี้ครอบคลุม:
+เพิ่ม score ใน module_progress
+เพิ่ม unique index สำหรับ module_progress(user_id,module_id) และ course_modules(course_id,code)
+insert/update 6 courses ด้วย UUID เดิม
+insert/update 47 modules ครบแล้ว = 35 lesson modules จาก LMS + 12 PRE/POST
+MATRIX ใช้ MT01-MT06
+BLUEPRINT ใช้ B1,B2,B3,B5,B6,B7
+FRONTIER ใช้ F1,F2,F3,F5,F6,F7
+คำอธิบาย B7/F7: ถูกต้องตามที่คุณสรุปค่ะ B4 merge เข้า B3, F4 merge เข้า F3 แต่ Day 2 ยังใช้เลขเดิม เลยข้ามไป B5-B7 และ F5-F7
+
+
 ซ่อม LMS ด้วย
 แก้ไฟล์ Creatr365_LMS_v2.jsx (line 282) แล้ว จุดที่มี TODO หลุดเข้าไปกลาง fetch() ทำให้ build พัง ตอนนี้แก้ให้ save-score ส่ง lessonId เช่น MT01, B7, F7 ไปหา course_modules.code ได้ถูกต้อง
 ตรวจแล้ว npm run build ของ LMS ผ่านค่ะ
