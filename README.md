@@ -1,3 +1,20 @@
+ซ่อม LMS ด้วย
+แก้ไฟล์ Creatr365_LMS_v2.jsx (line 282) แล้ว จุดที่มี TODO หลุดเข้าไปกลาง fetch() ทำให้ build พัง ตอนนี้แก้ให้ save-score ส่ง lessonId เช่น MT01, B7, F7 ไปหา course_modules.code ได้ถูกต้อง
+ตรวจแล้ว npm run build ของ LMS ผ่านค่ะ
+คำตอบเรื่องหลังบ้าน:
+หลังบ้านเพิ่ม/แก้คอร์สยังมีในโปรเจกต์หลักที่ route /admin/courses
+ต้อง login ด้วย user ที่มี role admin ในตาราง user_roles
+ถ้าจะเพิ่มสิทธิ์ admin ใช้ SQL แนวนี้:
+sql
+
+
+
+insert into public.user_roles (user_id, role)
+values ('AUTH_USER_ID_HERE', 'admin')
+on conflict (user_id, role) do nothing;
+
+
+
 ข้อมูลเก็บที่ไหน:
 
 สมัครสมาชิกใหม่: auth.users
