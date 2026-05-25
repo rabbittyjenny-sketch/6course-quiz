@@ -1,53 +1,3 @@
-  const letters = q ? ["A","B","C","D"].filter(l => q[l.toLowerCase()]) : [];
-  const sel = answers[q?.id];
-  const isLast = idx === questions.length - 1;
-  const isFirst = idx === 0;
-
-  function select(letter) {
-    if (showExp) return;
-    setAnswers(prev => ({ ...prev, [q.id]: letter }));
-  }
-
-  function prev() {
-    if (isFirst) return;
-    setShowExp(false);
-    setIdx(i => i - 1);
-  }
-
-  function next() {
-    setShowExp(false);
-    if (isLast) {
-      const sc = calcScore(answers, questions);
-      setResult(sc);
-      setDone(true);
-    } else {
-      setIdx(i => i+1);
-    }
-  }
-
-  if (!q || !questions.length) {
-    return (
-      <div style={S.wrap}>
-        <div style={S.card}>
-          <div style={S.h2}>ไม่พบข้อสอบ</div>
-          <button onClick={() => onDone(null)} style={{ ...S.btn, marginTop:14 }}>กลับ</button>
-        </div>
-      </div>
-    );
-  }
-
-  if (done && result) {
-    const passed = threshold === 0 || result.pct >= threshold;
-    return (
-      <div style={{ ...S.wrap, maxWidth:560, paddingTop:40 }}>
-        <div style={S.card}>
-          <div style={{ textAlign:"center", padding:"14px 0" }}>
-            <div style={{ fontSize:40, marginBottom:8 }}>{passed?"✓":"✗"}</div>
-            <div style={{ fontSize:28, fontWeight:700, color:passed?"#1A6B3A":"#C0392B" }}>{result.pct}%</div>
-            {threshold > 0 && (
-              <div style={{ color:passed?"#1A6B3A":"#C0392B", marginBottom:4, fontSize:14 }}>
-                {passed?"ผ่าน":"ยังไม่ผ่าน"} — เกณฑ์ {threshold}%
-              </div>
             )}
             <div style={S.muted}>{result.correct} จาก {result.total} ข้อ</div>
             {threshold === 0 && <div style={{ ...S.muted, marginTop:6 }}>บันทึก Baseline เรียบร้อย</div>}
@@ -248,3 +198,53 @@ function CourseResults({ courseId, student, lessonScores, enrolledCourses, onBac
                 <div key={cId} style={{ ...S.cardSm, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                   <div>
                     <span style={{ fontWeight:700, fontSize:14 }}>{cId}</span>
+                    {c && <span style={{ ...S.muted, marginLeft:8 }}>{c.duration}</span>}
+                    {c && <div style={{ ...S.muted, fontSize:11, marginTop:2 }}>{c.desc}</div>}
+                  </div>
+                  <span style={S.badgeO}>{c?.badge || ""}</span>
+                </div>
+              );
+            })}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// 🚀  MAIN APP
+// ============================================================
+export default function Creatr365LMS() {
+  const hasKidParam = !!new URLSearchParams(window.location.search).get("kid");
+  const [screen, setScreen] = useState(hasKidParam ? "loading" : "login");
+  const [student, setStudent] = useState(null);
+  const [enrolledCourses, setEnrolledCourses] = useState([]);
+  const [courseProgress, setCourseProgress] = useState({});     // { courseId: { lessonsCompleted } }
+  const [activeCourse, setActiveCourse] = useState(null);
+  const [lessonStatus, setLessonStatus] = useState({});         // { [courseId]: { [lessonId|__pretest__]: "done" } }
+  const [lessonScores, setLessonScores] = useState({});         // { [courseId]: { [lessonId]: { qg, pct } } }
+  const [watchData, setWatchData] = useState({});               // { lessonId: { count, seconds } }
+  const [activeLesson, setActiveLesson] = useState(null);
+  const [quizCtx, setQuizCtx] = useState(null);
+  const [alert, setAlert] = useState(null);                     // watch-count alert
+
+  // Prevent right-click & copy globally
+  useEffect(() => {
+    // โหลด Sarabun font
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=Sarabun:ital,wght@0,400;0,600;0,700;0,800;1,400&display=swap";
+    document.head.appendChild(link);
+
+    const noCtx = e => e.preventDefault();
+    document.addEventListener("contextmenu", noCtx);
+    return () => {
+      document.removeEventListener("contextmenu", noCtx);
+    };
+  }, []);
+
+  function handleLogin(s, courses) {
+    setStudent(s);
+    setEnrolledCourses(courses);
+    setScreen("dashboard");
