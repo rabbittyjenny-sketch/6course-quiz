@@ -538,7 +538,18 @@ function LoginScreen({ onLogin }) {
 }
 
 // ── Dashboard ────────────────────────────────────────────────
-function Dashboard({ student, enrolledCourses, courseProgress, onSelect }) {
+// Shown only when the session arrived via a Dashboard.tsx token handoff
+// (dashboardUrl set) — direct-LINE-login sessions never see this.
+function BackToDashboardLink({ url, style }) {
+  if (!url) return null;
+  return (
+    <a href={url} style={{ ...S.muted, textDecoration:"none", display:"inline-flex", alignItems:"center", gap:4, ...style }}>
+      ← กลับสู่แดชบอร์ดของฉัน
+    </a>
+  );
+}
+
+function Dashboard({ student, enrolledCourses, courseProgress, onSelect, dashboardUrl }) {
   // Show only purchased courses, sorted by level (COURSE_ORDER)
   const allCourses = COURSE_ORDER
     .filter(id => enrolledCourses.includes(id))
@@ -548,7 +559,10 @@ function Dashboard({ student, enrolledCourses, courseProgress, onSelect }) {
   return (
     <div style={S.wrap}>
       <div style={{ padding:"22px 0 14px" }}>
-        <div style={S.h1}>สวัสดี, {student.name}</div>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div style={S.h1}>สวัสดี, {student.name}</div>
+          <BackToDashboardLink url={dashboardUrl} style={{ fontSize:12 }} />
+        </div>
         <div style={S.muted}>คอร์สของฉัน · {allCourses.length} คอร์ส</div>
       </div>
 
@@ -592,7 +606,7 @@ function Dashboard({ student, enrolledCourses, courseProgress, onSelect }) {
 }
 
 // ── Course View ───────────────────────────────────────────────
-function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBack, onPretest, onLesson, onSessionUnlock, onViewResults, onWatch }) {
+function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBack, onPretest, onLesson, onSessionUnlock, onViewResults, onWatch, dashboardUrl }) {
   const course = COURSES[courseId];
   const lessonStatus = allLessonStatus[courseId] || {};
   const lessonScores = allLessonScores[courseId] || {};
@@ -603,12 +617,15 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
 
   return (
     <div style={S.wrap}>
-      <div style={{ padding:"18px 0 4px", display:"flex", alignItems:"center", gap:12 }}>
-        <button onClick={onBack} style={{ ...S.btnOut, padding:"5px 12px", fontSize:12 }}>← กลับ</button>
-        <div>
-          <span style={{ fontWeight:700, fontSize:17 }}>{course.name}</span>
-          <span style={{ ...S.muted, marginLeft:10 }}>{course.duration}</span>
+      <div style={{ padding:"18px 0 4px", display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <button onClick={onBack} style={{ ...S.btnOut, padding:"5px 12px", fontSize:12 }}>← กลับ</button>
+          <div>
+            <span style={{ fontWeight:700, fontSize:17 }}>{course.name}</span>
+            <span style={{ ...S.muted, marginLeft:10 }}>{course.duration}</span>
+          </div>
         </div>
+        <BackToDashboardLink url={dashboardUrl} style={{ fontSize:12 }} />
       </div>
       <div style={{ ...S.muted, marginBottom:18 }}>{course.desc}</div>
 
@@ -986,7 +1003,7 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
 }
 
 // ── Course Results (Radar + Host Level + Recommendations) ─────
-function CourseResults({ courseId, student, lessonScores, enrolledCourses, onBack, onSelectCourse }) {
+function CourseResults({ courseId, student, lessonScores, enrolledCourses, onBack, onSelectCourse, dashboardUrl }) {
   const radar = useMemo(() => buildRadar(lessonScores), [lessonScores]);
   const overall = useMemo(() => Math.round(radar.reduce((a,b)=>a+b.value,0)/radar.length), [radar]);
   const level = getHostLevel(overall);
@@ -1005,7 +1022,10 @@ function CourseResults({ courseId, student, lessonScores, enrolledCourses, onBac
 
   return (
     <div style={{ ...S.wrap, maxWidth:640, paddingTop:28 }}>
-      <button onClick={onBack} style={{ ...S.btnOut, padding:"5px 12px", fontSize:12, marginBottom:20 }}>← กลับ</button>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+        <button onClick={onBack} style={{ ...S.btnOut, padding:"5px 12px", fontSize:12 }}>← กลับ</button>
+        <BackToDashboardLink url={dashboardUrl} style={{ fontSize:12 }} />
+      </div>
       <div style={S.card}>
         <div style={{ marginBottom:16 }}>
           <div style={S.h1}>ผลลัพธ์คอร์ส</div>
@@ -1123,6 +1143,10 @@ export default function Creatr365LMS() {
   const [activeLesson, setActiveLesson] = useState(null);
   const [quizCtx, setQuizCtx] = useState(null);
   const [alert, setAlert] = useState(null);                     // watch-count alert
+  // Set only when arriving via a Dashboard.tsx token handoff (never for a
+  // direct-LINE-login session, which has no dashboardUrl param) — lets us
+  // show a "back to dashboard" link without touching the direct-login path.
+  const [dashboardUrl, setDashboardUrl] = useState("");
 
   // Prevent right-click & copy globally
   useEffect(() => {
@@ -1198,6 +1222,8 @@ export default function Creatr365LMS() {
       const sid = redeemed.student_id;
       const courseParam = redeemed.course_slug?.trim().toLowerCase();
       const courseId = courseParam ? SLUG_TO_LMS[courseParam] : undefined;
+      const dashUrl = params.get("dashboardUrl");
+      if (dashUrl) setDashboardUrl(dashUrl);
 
       const { displayName, courses, registered } = await resolveEnrollment(sid);
       if (cancelled) return;
@@ -1409,6 +1435,7 @@ export default function Creatr365LMS() {
           enrolledCourses={enrolledCourses}
           courseProgress={courseProgress}
           onSelect={selectCourse}
+          dashboardUrl={dashboardUrl}
         />
       )}
 
@@ -1424,6 +1451,7 @@ export default function Creatr365LMS() {
           onSessionUnlock={lesson=>{setActiveLesson(lesson);setScreen("session_unlock");}}
           onViewResults={()=>setScreen("results")}
           onWatch={recordWatch}
+          dashboardUrl={dashboardUrl}
         />
       )}
 
@@ -1454,6 +1482,7 @@ export default function Creatr365LMS() {
           enrolledCourses={enrolledCourses}
           onBack={()=>setScreen("course")}
           onSelectCourse={(cId) => { setActiveCourse(cId); setScreen("course"); }}
+          dashboardUrl={dashboardUrl}
         />
       )}
 
