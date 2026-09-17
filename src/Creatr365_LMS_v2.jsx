@@ -26,6 +26,7 @@ const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwYnuFfq6E3GsU0
 
 const SUPABASE_ENROLL_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-enrollment";
 const SUPABASE_REDEEM_HANDOFF_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-lms-handoff";
+const SUPABASE_GET_PROGRESS_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-progress";
 const WEB_APP_REGISTER_URL = ""; // Optional direct-LMS fallback; Dashboard passes returnTo automatically.
 
 const IMG = {
@@ -303,6 +304,7 @@ async function api(params) {
           module_code: params.lesson_id,
           score: params.pct,
           passed: params.passed === true || params.passed === "true",
+          quiz_type: params.quiz_type || "",
         }),
       }).catch(() => {});
     }
@@ -367,6 +369,62 @@ async function resolveEnrollment(id) {
   }
 
   return { displayName, courses, registered };
+}
+
+// Rebuilds lessonStatus/lessonScores/courseProgress from real module_progress
+// rows (via get-progress) instead of the LMS starting every login with
+// every lesson locked from #1 — verified against production that this was
+// happening on every single login, even minutes after finishing lessons,
+// because nothing ever read progress back. Pretest completion is NOT
+// included here: it was only ever written to the old Apps Script backend
+// (apiSaveProgress), never to Supabase, so there is nothing real to
+// rehydrate it from yet — a returning student still redoes the pretest,
+// which only costs a few minutes since it has no pass/fail gate of its own.
+async function resolveProgress(studentId, enrolledCourseIds) {
+  const empty = { lessonStatus: {}, lessonScores: {}, courseProgress: {} };
+  try {
+    const res = await fetch(SUPABASE_GET_PROGRESS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ student_id: studentId }),
+    });
+    if (!res.ok) return empty;
+    const { progress } = await res.json();
+    if (!progress) return empty;
+
+    const lessonStatus = {};
+    const lessonScores = {};
+    const courseProgress = {};
+
+    enrolledCourseIds.forEach(courseId => {
+      const course = COURSES[courseId];
+      const slug = LMS_TO_SLUG[courseId];
+      const byModule = slug ? progress[slug] : null;
+      if (!course || !byModule) return;
+
+      const statusForCourse = {};
+      const scoresForCourse = {};
+      let doneCount = 0;
+      course.lessons.forEach(lesson => {
+        const entry = byModule[lesson.id];
+        if (entry?.status === "completed") {
+          statusForCourse[lesson.id] = "done";
+          scoresForCourse[lesson.id] = { qg: lesson.qg, pct: entry.score ?? 0 };
+          doneCount++;
+        }
+      });
+      if (doneCount > 0) {
+        lessonStatus[courseId] = statusForCourse;
+        lessonScores[courseId] = scoresForCourse;
+        courseProgress[courseId] = { lessonsCompleted: doneCount };
+      }
+    });
+
+    return { lessonStatus, lessonScores, courseProgress };
+  } catch (e) {
+    console.error("[get-progress]", e);
+    return empty;
+  }
 }
 
 // ============================================================
@@ -1085,6 +1143,15 @@ export default function Creatr365LMS() {
     setStudent(s);
     setEnrolledCourses(courses);
     setScreen("dashboard");
+    // Fire-and-forget: fills in lessonStatus/lessonScores/courseProgress a
+    // beat after the dashboard/course view first renders (locked-by-default
+    // until this resolves) rather than blocking the login transition on it.
+    resolveProgress(s.id, courses).then(({ lessonStatus, lessonScores, courseProgress }) => {
+      if (Object.keys(lessonStatus).length === 0) return;
+      setLessonStatus(prev => ({ ...prev, ...lessonStatus }));
+      setLessonScores(prev => ({ ...prev, ...lessonScores }));
+      setCourseProgress(prev => ({ ...prev, ...courseProgress }));
+    });
   }
 
   // Auto-login จาก ?token=<handoff token> ใน URL (มาจาก Dashboard.tsx)
@@ -1195,11 +1262,16 @@ export default function Creatr365LMS() {
 
     if (!qs.length) { markLessonDone(lesson, 100); setScreen("course"); return; }
     setActiveLesson(lesson);
-    setQuizCtx({ 
-      questions: qs, 
-      title: isLast ? "แบบประเมินวินิจฉัย (Post-test)" : `KC: ${lesson.name}`, 
-      threshold: CFG.passThreshold, 
-      quizType: isLast ? "diagnostic" : "knowledge_check", 
+    setQuizCtx({
+      questions: qs,
+      title: isLast ? "แบบประเมินวินิจฉัย (Post-test)" : `KC: ${lesson.name}`,
+      // Diagnostic Quiz has no pass/fail (Completion Record framework —
+      // it's a skill-radar snapshot, not a gate): threshold 0 makes
+      // QuizEngine always treat it as "passed" (single "continue" button,
+      // no fail/retake framing) and always unlocks/completes the course's
+      // last module below, regardless of score.
+      threshold: isLast ? 0 : CFG.passThreshold,
+      quizType: isLast ? "diagnostic" : "knowledge_check",
       qg: lesson.qg,
       lessonId: lesson.id,
     });
@@ -1243,19 +1315,42 @@ export default function Creatr365LMS() {
       return;
     }
 
-    // Knowledge Check / Diagnostic
-    markLessonDone(activeLesson, result.pct);
-    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, result.pct >= CFG.passThreshold, quizCtx.lessonId);
+    // Knowledge Check / Diagnostic — only unlock the next lesson when the
+    // student actually meets this quiz's threshold (0 for Diagnostic, which
+    // never blocks; CFG.passThreshold for a real Knowledge Check). Used to
+    // call markLessonDone unconditionally here regardless of score, so a
+    // failed KC quiz still unlocked the next lesson — direct contradiction
+    // of "must pass the post-test to unlock, no skipping lessons". A failed
+    // attempt is still logged (apiSaveScore below, passed=false) for the
+    // audit trail, it just doesn't advance anything.
+    const passed = quizCtx.threshold === 0 || result.pct >= quizCtx.threshold;
+    if (passed) {
+      markLessonDone(activeLesson, result.pct);
+    }
+    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, passed, quizCtx.lessonId);
     setActiveLesson(null);
     setScreen("course");
   }
 
-  // Session unlock (Onsite)
+  // Session unlock (Onsite) — same isLast/diagnostic split as
+  // startLessonQuiz above; onsite courses (STAGE, ARCHITECT) route every
+  // session through here, including the last one, so without this check
+  // their final session could never trigger a Diagnostic Quiz / Completion
+  // Record at all.
   function handleSessionUnlocked(lesson) {
-    const qs = getLessonQuiz(lesson);
+    const course = COURSES[activeCourse];
+    const isLast = course.lessons[course.lessons.length-1].id === lesson.id;
+    const qs = isLast ? getDiagnosticQuiz(course) : getLessonQuiz(lesson);
     if (!qs.length) { markLessonDone(lesson, 100); setScreen("course"); return; }
     setActiveLesson(lesson);
-    setQuizCtx({ questions:qs, title:lesson.name, threshold:CFG.passThreshold, quizType:"knowledge_check", qg:lesson.qg, lessonId: lesson.id });
+    setQuizCtx({
+      questions: qs,
+      title: isLast ? "แบบประเมินวินิจฉัย (Post-test)" : lesson.name,
+      threshold: isLast ? 0 : CFG.passThreshold,
+      quizType: isLast ? "diagnostic" : "knowledge_check",
+      qg: lesson.qg,
+      lessonId: lesson.id,
+    });
     setScreen("quiz");
   }
 
