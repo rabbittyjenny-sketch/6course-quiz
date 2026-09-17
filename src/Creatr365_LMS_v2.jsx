@@ -25,6 +25,7 @@ import {
 const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwYnuFfq6E3GsU0fYznj9jrdM6hl3736ET1i3k4iZGCK5-2fyRTjF9ANHaAYdtIgV6XJQ/exec";
 
 const SUPABASE_ENROLL_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-enrollment";
+const SUPABASE_REDEEM_HANDOFF_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-lms-handoff";
 const WEB_APP_REGISTER_URL = ""; // Optional direct-LMS fallback; Dashboard passes returnTo automatically.
 
 const IMG = {
@@ -1052,8 +1053,8 @@ function CourseResults({ courseId, student, lessonScores, enrolledCourses, onBac
 // 🚀  MAIN APP
 // ============================================================
 export default function Creatr365LMS() {
-  const hasKidParam = !!new URLSearchParams(window.location.search).get("kid");
-  const [screen, setScreen] = useState(hasKidParam ? "loading" : "login");
+  const hasHandoffToken = !!new URLSearchParams(window.location.search).get("token");
+  const [screen, setScreen] = useState(hasHandoffToken ? "loading" : "login");
   const [student, setStudent] = useState(null);
   const [enrolledCourses, setEnrolledCourses] = useState([]);
   const [courseProgress, setCourseProgress] = useState({});     // { courseId: { lessonsCompleted } }
@@ -1086,36 +1087,62 @@ export default function Creatr365LMS() {
     setScreen("dashboard");
   }
 
-  // Auto-login จาก ?kid=STU-001&course=signal ใน URL (มาจาก Dashboard)
+  // Auto-login จาก ?token=<handoff token> ใน URL (มาจาก Dashboard.tsx)
   //
-  // Dashboard.tsx ส่ง course=<courses.slug> มาตรงๆ (เช่น "brand-host-architect")
-  // ต้องแปลง slug -> LMS course id ด้วย SLUG_TO_LMS (inverse ของ LMS_TO_SLUG)
-  // ห้ามเดาด้วย toUpperCase().replace("-","_") เพราะไม่ตรงกับ id จริงสักตัว
-  // เช่น "brand-host-architect" -> "BRAND_HOST_ARCHITECT" (ผิด) แทนที่จะเป็น
-  // "COURSE_3_BRAND_HOST" (id จริงใน COURSES) — บั๊กนี้ทำให้กด "เข้าเรียน" จาก
-  // Dashboard แล้วไม่เคยเปิดคอร์สตรงให้อัตโนมัติเลยสักคอร์สเดียว
+  // SECURITY: this used to be `?kid=STU-001` — the bare Master Key in the
+  // URL, which let anyone who saw that link (browser history, a shared
+  // screen, a copy-pasted message) log in as that student with zero further
+  // proof. Dashboard.tsx now calls the create-lms-handoff edge function
+  // (server-side, from the student's own authenticated session) and hands
+  // us a random, single-use, 60-second token instead — redeem-lms-handoff
+  // is the only thing that can turn that token back into a student_id, and
+  // it can only do so once. A leaked/copied/reused link is worthless here:
+  // by the time anyone else opens it, it has either already been redeemed
+  // by the real student's browser or has expired.
+  //
+  // redeem-lms-handoff returns course_slug (set server-side when the token
+  // was created) instead of trusting a client-supplied ?course= param.
+  // Dashboard.tsx sends course=<courses.slug> (e.g. "brand-host-architect")
+  // — must go through SLUG_TO_LMS (inverse of LMS_TO_SLUG) to get the real
+  // LMS course id ("COURSE_3_BRAND_HOST"), never a guessed
+  // toUpperCase().replace("-","_") transform, which doesn't match any real
+  // id and silently breaks the auto-open-course behavior.
   useEffect(() => {
     let cancelled = false;
 
     async function runAutoLogin() {
       const params = new URLSearchParams(window.location.search);
-      const kid = params.get("kid")?.trim();
-      if (!kid) return;
-      const courseParam = params.get("course")?.trim().toLowerCase();
+      const token = params.get("token")?.trim();
+      if (!token) return;
+
+      let redeemed = null;
+      try {
+        const res = await fetch(SUPABASE_REDEEM_HANDOFF_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        if (res.ok) redeemed = await res.json();
+      } catch (_) { /* handled below via redeemed === null */ }
+
+      if (cancelled) return;
+      if (!redeemed?.student_id) { setScreen("login"); return; }
+
+      const sid = redeemed.student_id;
+      const courseParam = redeemed.course_slug?.trim().toLowerCase();
       const courseId = courseParam ? SLUG_TO_LMS[courseParam] : undefined;
 
-      if (!kid) { if (!cancelled) setScreen("login"); return; }
-      const { displayName, courses, registered } = await resolveEnrollment(kid);
+      const { displayName, courses, registered } = await resolveEnrollment(sid);
       if (cancelled) return;
 
       if (!registered) {
-        const returnTo = params.get("returnTo") || (WEB_APP_REGISTER_URL ? `${WEB_APP_REGISTER_URL}?master_key=${encodeURIComponent(kid)}` : "");
+        const returnTo = params.get("returnTo") || (WEB_APP_REGISTER_URL ? `${WEB_APP_REGISTER_URL}?master_key=${encodeURIComponent(sid)}` : "");
         if (returnTo) { window.location.href = returnTo; return; }
         setScreen("login");
         return;
       }
       if (!courses.length) { setScreen("login"); return; }
-      handleLogin({ id: kid, name: displayName }, courses);
+      handleLogin({ id: sid, name: displayName }, courses);
       if (courseId && courses.includes(courseId)) {
         setActiveCourse(courseId);
         setScreen("course");
