@@ -28,6 +28,7 @@ const SUPABASE_ENROLL_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/
 const SUPABASE_REDEEM_HANDOFF_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-lms-handoff";
 const SUPABASE_GET_PROGRESS_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-progress";
 const SUPABASE_SAVE_SUBMISSION_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/save-submission";
+const SUPABASE_REDEEM_SESSION_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-session-code";
 const WEB_APP_REGISTER_URL = ""; // Optional direct-LMS fallback; Dashboard passes returnTo automatically.
 
 const IMG = {
@@ -322,8 +323,6 @@ const apiSaveWatch    = (sid,c,l,secs,count) =>
   api({ action:"save_progress", sid, course:c, lesson:l, status:"watching", watch_seconds:secs, watch_count:count });
 const apiSaveSubmit   = (sid,c,rubric,sub_type,url) =>
   api({ action:"save_submission", sid, course:c, rubric_id:rubric||"", sub_type, url });
-const apiUnlockSession= (sid,c,sr,code) =>
-  api({ action:"unlock_session", sid, course:c, session_ref:sr, code });
 
 function normalizeEnrollmentCourses(input) {
   const raw = Array.isArray(input) ? input : [];
@@ -839,8 +838,22 @@ function SessionUnlock({ lesson, courseId, student, onUnlocked, onBack }) {
   async function handle() {
     if (code.length !== 4) { setErr("กรอกรหัส 4 หลัก"); return; }
     setLoading(true); setErr("");
-    const res = await apiUnlockSession(student.id, courseId, lesson.id, code);
-    if (res?.success || !CFG.useApi || APPS_SCRIPT_URL.startsWith("REPLACE")) {
+    // Validated against course_modules.onsite_unlock_code in Supabase — this
+    // used to go through the legacy Google Apps Script backend, which had no
+    // admin UI anywhere in this system to set or rotate the code.
+    const courseSlug = LMS_TO_SLUG[courseId] || String(courseId || "").toLowerCase().replace(/_/g, "-");
+    let success = false;
+    try {
+      const res = await fetch(SUPABASE_REDEEM_SESSION_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ student_id: student.id, course_slug: courseSlug, module_code: lesson.id, code }),
+      });
+      const data = await res.json();
+      success = data?.success === true;
+    } catch (e) { console.error("[redeem-session-code]", e); }
+
+    if (success) {
       onUnlocked(lesson);
     } else {
       setErr("รหัสไม่ถูกต้อง — ถามอาจารย์อีกครั้ง");
