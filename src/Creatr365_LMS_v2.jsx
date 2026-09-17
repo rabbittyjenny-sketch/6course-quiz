@@ -27,6 +27,7 @@ const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwYnuFfq6E3GsU0
 const SUPABASE_ENROLL_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-enrollment";
 const SUPABASE_REDEEM_HANDOFF_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-lms-handoff";
 const SUPABASE_GET_PROGRESS_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-progress";
+const SUPABASE_SAVE_SUBMISSION_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/save-submission";
 const WEB_APP_REGISTER_URL = ""; // Optional direct-LMS fallback; Dashboard passes returnTo automatically.
 
 const IMG = {
@@ -791,7 +792,23 @@ function SubmissionCard({ courseId, sub, student }) {
 
   async function submit() {
     if (!url.trim()) return;
-    await apiSaveSubmit(student.id, courseId, sub.rubric, "submission", url.trim());
+    const trimmedUrl = url.trim();
+    await apiSaveSubmit(student.id, courseId, sub.rubric, "submission", trimmedUrl);
+    // Also record into Supabase's `assignments` table — the legacy Apps
+    // Script call above never reaches AdminAssignments.tsx, the page admins
+    // actually use to review/grade submissions.
+    const courseSlug = LMS_TO_SLUG[courseId] || String(courseId || "").toLowerCase().replace(/_/g, "-");
+    fetch(SUPABASE_SAVE_SUBMISSION_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        student_id: student.id,
+        course_slug: courseSlug,
+        rubric_id: sub.rubric || "",
+        sub_type: "submission",
+        url: trimmedUrl,
+      }),
+    }).catch(() => {});
     setSent(true);
   }
 
