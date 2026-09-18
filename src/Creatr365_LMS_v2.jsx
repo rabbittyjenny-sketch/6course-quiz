@@ -187,35 +187,46 @@ function getQsByQG(qgs, phase, count) {
   return count ? pool.slice(0, count) : pool;
 }
 
+// หยิบ `count` ข้อจาก arr แบบต่อคิว วนกลับไปต้นได้ถ้าคิวไม่พอ (ยังกำหนดแน่นอนเสมอ)
+function takeSlice(arr, start, count) {
+  const out = [];
+  for (let i = 0; i < count && arr.length; i++) out.push(arr[(start + i) % arr.length]);
+  return out;
+}
+
 /**
  * ดึงข้อสอบ KC สำหรับแต่ละบท:
  * - ใช้ทุก phase (Pre + During + Post) เพื่อให้มีข้อเยอะพอ
- * - Shuffle ด้วย lesson.id เป็น seed → แต่ละบทได้ข้อต่างกัน
- *   แม้จะมี QG เดียวกัน (เช่น M01,M02,M03 ล้วนเป็น QG-01)
+ * - Shuffle คลังข้อของ QG นั้นด้วย qg เป็น seed ครั้งเดียว แล้วแบ่งเป็นคิวต่อเนื่อง
+ *   ให้แต่ละบทที่ใช้ QG เดียวกัน (เช่น M01,M02,M03) ได้ข้อ "คนละช่วง" ของคิว
+ *   แทนที่จะสุ่มใหม่อิสระต่อบท ซึ่งทำให้ข้อซ้ำกันข้ามบทได้บ่อย
  */
-function getLessonQuiz(lesson) {
+function getLessonQuiz(lesson, course) {
   const pool = QUIZ_BANK.filter(q => q.qg === lesson.qg);
   if (!pool.length) return [];
-  const shuffled = seededShuffle(pool, lesson.id);
-  return shuffled.slice(0, Math.min(5, shuffled.length));
+  const shuffled = seededShuffle(pool, lesson.qg);
+  const sameQgLessons = (course?.lessons || [lesson]).filter(l => l.qg === lesson.qg);
+  const position = Math.max(0, sameQgLessons.findIndex(l => l.id === lesson.id));
+  return takeSlice(shuffled, position * 5, Math.min(5, shuffled.length));
 }
 
 /**
  * ดึงข้อสอบวินิจฉัยรวม (บทสุดท้าย):
- * - ดึงจากทุก QG ของคอร์ส, ทุก phase
- * - Shuffle ด้วย courseId+"_diag" เป็น seed
- * - สูงสุด 15 ข้อ (ครอบคลุมทุกมิติ)
+ * - ดึงจากทุก QG ของคอร์ส กระจายสมดุล สูงสุด 15 ข้อ
+ * - ต่อคิวเดียวกันกับที่บทเรียนของ QG นั้นใช้ไปแล้ว (เริ่มถัดจากข้อสุดท้ายที่บทเรียน
+ *   หยิบไป) เพื่อลดโอกาสได้ข้อซ้ำกับที่เคยทำมาก่อนหน้าให้มากที่สุดเท่าที่คลังข้อมีพอ
  */
 function getDiagnosticQuiz(course) {
   const uniqueQGs = [...new Set(course.lessons.map(l => l.qg).filter(Boolean))];
-  const pool = QUIZ_BANK.filter(q => uniqueQGs.includes(q.qg));
-  const shuffled = seededShuffle(pool, course.id + "_diag");
-  // กระจาย QG — เอาข้อแรกของแต่ละ QG ก่อน ให้ครอบคลุม
-  const byQG = {};
-  shuffled.forEach(q => { if (!byQG[q.qg]) byQG[q.qg] = []; byQG[q.qg].push(q); });
-  const spread = [];
   const max = Math.ceil(15 / uniqueQGs.length);
-  uniqueQGs.forEach(qg => spread.push(...(byQG[qg] || []).slice(0, max)));
+  const spread = [];
+  uniqueQGs.forEach(qg => {
+    const pool = QUIZ_BANK.filter(q => q.qg === qg);
+    if (!pool.length) return;
+    const shuffled = seededShuffle(pool, qg);
+    const lessonsForQg = course.lessons.filter(l => l.qg === qg).length;
+    spread.push(...takeSlice(shuffled, lessonsForQg * 5, Math.min(max, shuffled.length)));
+  });
   return spread.slice(0, 15);
 }
 
@@ -456,11 +467,8 @@ const S = {
   choiceBase: { borderRadius:3, padding:"12px 16px", marginBottom:8, cursor:"pointer", display:"flex", gap:10, alignItems:"flex-start" },
 };
 
-function choiceStyle(sel, correct, show, letter) {
-  if (!show) return { ...S.choiceBase, border: sel===letter?"2px solid #111":"1.5px solid #DDD", background:sel===letter?"#F0F0F0":"#fff" };
-  if (letter===correct) return { ...S.choiceBase, border:"2px solid #1A6B3A", background:"#F0FAF4" };
-  if (sel===letter) return { ...S.choiceBase, border:"2px solid #C0392B", background:"#FDF0F0" };
-  return { ...S.choiceBase, border:"1.5px solid #DDD", background:"#fff", opacity:.6 };
+function choiceStyle(sel, letter) {
+  return { ...S.choiceBase, border: sel===letter?"2px solid #111":"1.5px solid #DDD", background:sel===letter?"#F0F0F0":"#fff" };
 }
 
 // ============================================================
@@ -885,7 +893,6 @@ function SessionUnlock({ lesson, courseId, student, onUnlocked, onBack }) {
 function QuizEngine({ questions, title, threshold, courseId, quizType, qg, student, onDone }) {
   const [idx, setIdx] = useState(0);
   const [answers, setAnswers] = useState({});
-  const [showExp, setShowExp] = useState(false);
   const [done, setDone] = useState(false);
   const [result, setResult] = useState(null);
 
@@ -896,18 +903,15 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
   const isFirst = idx === 0;
 
   function select(letter) {
-    if (showExp) return;
     setAnswers(prev => ({ ...prev, [q.id]: letter }));
   }
 
   function prev() {
     if (isFirst) return;
-    setShowExp(false);
     setIdx(i => i - 1);
   }
 
   function next() {
-    setShowExp(false);
     if (isLast) {
       const sc = calcScore(answers, questions);
       setResult(sc);
@@ -990,22 +994,14 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
         <div style={{ ...S.muted, marginBottom:8 }}>{q.qg}</div>
         <div style={{ fontSize:15, fontWeight:600, marginBottom:18, lineHeight:1.5 }}>{q.q}</div>
         {letters.map(letter => (
-          <div key={letter} style={choiceStyle(sel, q.ans, showExp, letter)} onClick={()=>select(letter)}>
+          <div key={letter} style={choiceStyle(sel, letter)} onClick={()=>select(letter)}>
             <span style={{ width:22, height:22, borderRadius:99, border:"1.5px solid #CCC",
               display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:700, flexShrink:0,
-              background: showExp&&letter===q.ans?"#1A6B3A": showExp&&sel===letter&&letter!==q.ans?"#C0392B":"transparent",
-              color: showExp&&(letter===q.ans||sel===letter)?"#fff":"#555",
-              borderColor: showExp&&letter===q.ans?"#1A6B3A": showExp&&sel===letter&&letter!==q.ans?"#C0392B":"#CCC",
+              color:"#555",
             }}>{letter}</span>
             <span style={{ fontSize:14 }}>{q[letter.toLowerCase()]}</span>
           </div>
         ))}
-        {showExp && (
-          <div style={{ background:"#F8F8F8", border:"1px solid #E5E5E5", borderRadius:3, padding:"12px 14px", marginTop:8 }}>
-            <div style={{ fontSize:11, fontWeight:700, color:"#555", marginBottom:3 }}>อธิบาย</div>
-            <div style={{ fontSize:13, color:"#333", lineHeight:1.6 }}>{q.exp}</div>
-          </div>
-        )}
         <div style={{ display:"flex", gap:10, marginTop:18 }}>
           {/* ปุ่ม Back — ย้อนกลับข้อก่อน */}
           {!isFirst && (
@@ -1014,15 +1010,8 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
             </button>
           )}
 
-          {/* ปุ่มดูเฉลย — แสดงเมื่อมีการเลือกคำตอบแล้ว */}
-          {sel && !showExp && (
-            <button onClick={() => setShowExp(true)} style={S.btnOut}>
-              ดูเฉลย
-            </button>
-          )}
-
-          {(showExp || sel) && (
-            <button onClick={next} disabled={!sel} style={{ ...S.btn, flex: 1 }}>
+          {sel && (
+            <button onClick={next} style={{ ...S.btn, flex: 1 }}>
               {isLast ? "ดูผลลัพธ์ →" : "ข้อถัดไป →"}
             </button>
           )}
@@ -1312,8 +1301,8 @@ export default function Creatr365LMS() {
       // Diagnostic: ดึงจากทุก QG ของคอร์ส, กระจายสมดุล, สูงสุด 15 ข้อ
       qs = getDiagnosticQuiz(course);
     } else {
-      // KC Quiz: ใช้ seededShuffle ตาม lesson.id → ข้อต่างกันทุกบท
-      qs = getLessonQuiz(lesson);
+      // KC Quiz: ต่อคิวข้อสอบของ QG นี้ตามลำดับบท → ไม่ซ้ำกับบทก่อนหน้า
+      qs = getLessonQuiz(lesson, course);
     }
 
     if (!qs.length) { markLessonDone(lesson, 100); setScreen("course"); return; }
@@ -1396,7 +1385,7 @@ export default function Creatr365LMS() {
   function handleSessionUnlocked(lesson) {
     const course = COURSES[activeCourse];
     const isLast = course.lessons[course.lessons.length-1].id === lesson.id;
-    const qs = isLast ? getDiagnosticQuiz(course) : getLessonQuiz(lesson);
+    const qs = isLast ? getDiagnosticQuiz(course) : getLessonQuiz(lesson, course);
     if (!qs.length) { markLessonDone(lesson, 100); setScreen("course"); return; }
     setActiveLesson(lesson);
     setQuizCtx({
