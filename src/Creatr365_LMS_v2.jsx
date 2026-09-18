@@ -132,7 +132,11 @@ const COURSES = {
       { id:"BH7", name:"P&L Mastery & Live Unit Economics",                dur:"วัน 2 · 13:00-15:30", url:null, qg:"QG-07", sessionCode:true, day:2 },
       { id:"BH8", name:"Global Market Intel & Scaling Strategy",           dur:"วัน 2 · 15:30-17:00", url:null, qg:"QG-07", sessionCode:true, day:2 },
     ],
-    submission: { enabled: true, rubric:"RUB-11", label:"ส่ง Scaling Readiness Scorecard + P&L Worksheet" },
+    // RUB-17 (not RUB-11): confirmed 18 ก.ย. 69 that RUB-11 is an EPK
+    // checklist with zero P&L content — mismatched with this label. RUB-11
+    // moved to BH2's onsite trainer scoring instead; RUB-17 was authored to
+    // actually match this worksheet deliverable (see rubrics.ts comment).
+    submission: { enabled: true, rubric:"RUB-17", label:"ส่ง Scaling Readiness Scorecard + P&L Worksheet" },
   },
 };
 
