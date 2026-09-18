@@ -299,30 +299,52 @@ const SLUG_TO_LMS = Object.fromEntries(
   Object.entries(LMS_TO_SLUG).map(([lmsId, slug]) => [slug, lmsId])
 );
 
-async function api(params) {
-  if (!CFG.useApi || APPS_SCRIPT_URL.startsWith("REPLACE")) return null;
+// บันทึกคะแนนจริงลง Supabase (module_progress) — แยกอิสระจากการเรียก Google
+// Apps Script เดิมด้านล่างโดยสิ้นเชิง เพราะเคยพบว่าถ้า Apps Script (ระบบเก่า)
+// ช้า/ล่ม/ถูกบล็อกจากเบราว์เซอร์บางชนิด (เช่น in-app browser ของ LINE) การ
+// throw จาก fetch เส้นนั้นจะทำให้โค้ดไม่มีทางไปถึงการบันทึกคะแนนจริงที่นี่เลย
+// — คะแนนที่ผู้เรียนเห็นบนหน้าจอ (คำนวณฝั่ง client) จึงดูเหมือนบันทึกสำเร็จ
+// ทั้งที่ไม่มีอะไรถูกเขียนลงฐานข้อมูลจริง ลองซ้ำ 1 ครั้งก่อนถือว่าล้มเหลวจริง
+async function saveScoreToSupabase(params, attempt = 1) {
+  const courseSlug = LMS_TO_SLUG[params.course] || String(params.course || "").toLowerCase().replace(/_/g, "-");
   try {
-    const url = new URL(APPS_SCRIPT_URL);
-    Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
-    const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
-    if (params.action === "save_score" && params.sid && params.lesson_id) {
-      // ส่ง course_slug + lesson_id เพื่อให้ save-score หา course_modules.code ได้ถูก
-      const courseSlug = LMS_TO_SLUG[params.course] || String(params.course || "").toLowerCase().replace(/_/g, "-");
-      fetch(SUPABASE_SAVE_SCORE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          student_id: params.sid,
-          course_slug: courseSlug,
-          module_code: params.lesson_id,
-          score: params.pct,
-          passed: params.passed === true || params.passed === "true",
-          quiz_type: params.quiz_type || "",
-        }),
-      }).catch(() => {});
-    }
-    return JSON.parse(await res.text());
-  } catch(e) { console.error("[API]", e); return null; }
+    const res = await fetch(SUPABASE_SAVE_SCORE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        student_id: params.sid,
+        course_slug: courseSlug,
+        module_code: params.lesson_id,
+        score: params.pct,
+        passed: params.passed === true || params.passed === "true",
+        quiz_type: params.quiz_type || "",
+      }),
+    });
+    if (!res.ok) throw new Error(`save-score HTTP ${res.status}: ${await res.text().catch(()=>"")}`);
+    return true;
+  } catch (e) {
+    console.error("[save-score]", e);
+    if (attempt < 2) return saveScoreToSupabase(params, attempt + 1);
+    return false;
+  }
+}
+
+async function api(params) {
+  let legacyResult = null;
+  if (CFG.useApi && !APPS_SCRIPT_URL.startsWith("REPLACE")) {
+    try {
+      const url = new URL(APPS_SCRIPT_URL);
+      Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
+      const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
+      legacyResult = JSON.parse(await res.text());
+    } catch(e) { console.error("[API legacy]", e); }
+  }
+
+  if (params.action === "save_score" && params.sid && params.lesson_id) {
+    const saved = await saveScoreToSupabase(params);
+    if (!saved) return { ...(legacyResult || {}), supabaseSaveFailed: true };
+  }
+  return legacyResult;
 }
 
 const apiGetStudent   = sid         => api({ action:"get_student", sid });
@@ -613,15 +635,66 @@ function Dashboard({ student, enrolledCourses, courseProgress, onSelect, dashboa
   );
 }
 
+// ── YouTube "watched to the end" detection ──────────────────────
+// ใช้ YouTube IFrame Player API (ผ่าน postMessage) เพื่อรู้จริงๆ ว่าคลิปเล่น
+// จบแล้ว ไม่ใช่แค่กดเปิดดู — ใช้ได้เฉพาะคลิปที่ฝังจาก youtube.com/embed/
+// เท่านั้น (URL ทุกอันในระบบตอนนี้เป็น YouTube embed ทั้งหมด) แพลตฟอร์มวิดีโอ
+// อื่นจะไม่มีการตรวจจับนี้ — ปุ่มทำแบบทดสอบจะเปิดได้ทันทีเหมือนเดิมสำหรับบทนั้น
+function isYouTubeEmbed(url) {
+  return typeof url === "string" && /^https:\/\/(www\.)?youtube(-nocookie)?\.com\/embed\//.test(url);
+}
+
+function withYouTubeJsApi(url) {
+  if (!isYouTubeEmbed(url)) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}`;
+}
+
+let youTubeApiPromise = null;
+function loadYouTubeApi() {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (youTubeApiPromise) return youTubeApiPromise;
+  youTubeApiPromise = new Promise((resolve) => {
+    const prevReady = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => { prevReady?.(); resolve(window.YT); };
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(tag);
+  });
+  return youTubeApiPromise;
+}
+
 // ── Course View ───────────────────────────────────────────────
-function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBack, onPretest, onLesson, onSessionUnlock, onViewResults, onWatch, dashboardUrl }) {
+function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBack, onPretest, onLesson, onSessionUnlock, onViewResults, onWatch, videoWatched, onVideoEnded, dashboardUrl }) {
   const course = COURSES[courseId];
   const lessonStatus = allLessonStatus[courseId] || {};
   const lessonScores = allLessonScores[courseId] || {};
   const [playingVideo, setPlayingVideo] = useState(null);
+  const ytPlayerRef = useRef(null);
   const isOnsite = course.type === "onsite";
   const pretestDone = lessonStatus["__pretest__"] === "done";
   const allDone = course.lessons.every(l => lessonStatus[l.id] === "done");
+
+  // ผูก YouTube IFrame Player API กับคลิปที่กำลังเปิดอยู่ เพื่อจับ "เล่นจบจริง"
+  useEffect(() => {
+    if (!playingVideo || !isYouTubeEmbed(playingVideo.url)) return;
+    let cancelled = false;
+    loadYouTubeApi().then(YT => {
+      if (cancelled) return;
+      ytPlayerRef.current = new YT.Player(`yt-frame-${playingVideo.id}`, {
+        events: {
+          onStateChange: (e) => {
+            if (e.data === YT.PlayerState.ENDED) onVideoEnded(playingVideo.id);
+          },
+        },
+      });
+    });
+    return () => {
+      cancelled = true;
+      ytPlayerRef.current?.destroy?.();
+      ytPlayerRef.current = null;
+    };
+  }, [playingVideo]);
 
   return (
     <div style={S.wrap}>
@@ -669,7 +742,9 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
         const prevDone = i === 0
           ? (pretestDone || course.pretestCount === 0)
           : lessonStatus[course.lessons[i-1].id] === "done";
-        const canStart = prevDone && status !== "done";
+        const hasVideo = !isOnsite && lesson.url && !lesson.url.startsWith("REPLACE");
+        const videoDone = !hasVideo || !!videoWatched[lesson.id];
+        const canStart = prevDone && status !== "done" && videoDone;
         const isDone   = status === "done";
         const isLocked = !prevDone && !isDone;
 
@@ -712,6 +787,11 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
               {/* ไอคอนล็อค — แสดงเฉพาะเมื่อบทยังล็อคอยู่จริงๆ */}
               {isLocked && (
                 <span style={{ ...S.muted, fontSize:11 }}>🔒 ล็อค</span>
+              )}
+
+              {/* ดูคลิปครบแล้ว ยังไม่ครบ — ต้องดูจบก่อนถึงจะทำแบบทดสอบได้ */}
+              {!isLocked && !isDone && prevDone && hasVideo && !videoDone && (
+                <span style={{ ...S.muted, fontSize:11 }}>ดูคลิปให้จบก่อน</span>
               )}
 
               {/* Onsite: กรอกรหัส */}
@@ -774,7 +854,8 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
             </button>
             <div style={{ position:"relative", paddingBottom:"56.25%", height:0, overflow:"hidden", background:"#000" }}>
               <iframe
-                src={playingVideo.url}
+                id={`yt-frame-${playingVideo.id}`}
+                src={withYouTubeJsApi(playingVideo.url)}
                 style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%" }}
                 frameBorder="0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
@@ -1159,6 +1240,11 @@ export default function Creatr365LMS() {
   const [lessonStatus, setLessonStatus] = useState({});         // { [courseId]: { [lessonId|__pretest__]: "done" } }
   const [lessonScores, setLessonScores] = useState({});         // { [courseId]: { [lessonId]: { qg, pct } } }
   const [watchData, setWatchData] = useState({});               // { lessonId: { count, seconds } }
+  // ต้องดูคลิปจนจบก่อนจึงจะทำแบบทดสอบของบทนั้นได้ (ตามที่ออกแบบไว้แต่แรก) —
+  // เก็บเฉพาะช่วงเซสชันนี้เท่านั้น ยังไม่ได้ persist ลง Supabase ข้ามการ login
+  // ใหม่ (ต้องตัดสินใจเรื่อง schema ก่อน — ดูคอมเมนต์ที่ markVideoEnded)
+  const [videoWatched, setVideoWatched] = useState({});          // { [courseId]: { [lessonId]: true } }
+  const [saveError, setSaveError] = useState(false);             // save-score ล้มเหลวจริงหลังลองซ้ำแล้ว
   const [activeLesson, setActiveLesson] = useState(null);
   const [quizCtx, setQuizCtx] = useState(null);
   const [alert, setAlert] = useState(null);                     // watch-count alert
@@ -1354,7 +1440,8 @@ export default function Creatr365LMS() {
         const cur = prev[activeCourse] || {};
         return { ...prev, [activeCourse]: { ...cur, "__pretest__": "done" } };
       });
-      apiSaveScore(student?.id, activeCourse, "pretest", quizCtx.qg, result.correct, result.total, result.pct, true);
+      apiSaveScore(student?.id, activeCourse, "pretest", quizCtx.qg, result.correct, result.total, result.pct, true)
+        .then(r => { if (r?.supabaseSaveFailed) setSaveError(true); });
       apiSaveProgress(student?.id, activeCourse, "__pretest__", "done");
       setScreen("course");
       return;
@@ -1372,7 +1459,8 @@ export default function Creatr365LMS() {
     if (passed) {
       markLessonDone(activeLesson, result.pct);
     }
-    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, passed, quizCtx.lessonId);
+    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, passed, quizCtx.lessonId)
+      .then(r => { if (r?.supabaseSaveFailed) setSaveError(true); });
     setActiveLesson(null);
     setScreen("course");
   }
@@ -1414,6 +1502,15 @@ export default function Creatr365LMS() {
     }
   }
 
+  // เรียกเมื่อผู้เล่นวิดีโอ (YouTube) ส่งสถานะ "จบคลิป" มาจริงๆ ผ่าน IFrame
+  // Player API — ปลดล็อกปุ่ม "ทำแบบทดสอบ" ของบทนั้น (เฉพาะเซสชันนี้)
+  function markVideoEnded(lessonId) {
+    setVideoWatched(prev => ({
+      ...prev,
+      [activeCourse]: { ...(prev[activeCourse] || {}), [lessonId]: true },
+    }));
+  }
+
   const activeCourseStatus = lessonStatus[activeCourse] || {};
   const allLessonsDone = activeCourse &&
     COURSES[activeCourse].lessons.every(l => activeCourseStatus[l.id]==="done");
@@ -1421,6 +1518,16 @@ export default function Creatr365LMS() {
   return (
     <div style={S.page} onCopy={e=>e.preventDefault()}>
       <Header student={screen!=="login"?student:null} onLogout={handleLogout} />
+
+      {/* บันทึกคะแนนไป Supabase ไม่สำเร็จ (แม้ลองซ้ำแล้ว) — แจ้งตรงๆ แทนที่จะ
+          ปล่อยให้ผู้เรียนเข้าใจผิดว่าคะแนนที่เห็นบนจอถูกบันทึกแล้ว */}
+      {saveError && (
+        <div style={{ position:"fixed", top:0, left:0, right:0, background:"#C0392B", color:"#fff",
+          padding:"10px 16px", fontSize:13, zIndex:10001, display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
+          <span>⚠ บันทึกคะแนนล่าสุดไปยังระบบไม่สำเร็จ กรุณาถ่ายภาพหน้าจอผลคะแนนไว้ แล้วแจ้งทีมงาน</span>
+          <button onClick={()=>setSaveError(false)} style={{ background:"none", border:"1px solid #fff", color:"#fff", borderRadius:3, padding:"4px 10px", cursor:"pointer", flexShrink:0 }}>ปิด</button>
+        </div>
+      )}
 
       {/* Watch-count alert popup */}
       {alert && (
@@ -1470,6 +1577,8 @@ export default function Creatr365LMS() {
           onSessionUnlock={lesson=>{setActiveLesson(lesson);setScreen("session_unlock");}}
           onViewResults={()=>setScreen("results")}
           onWatch={recordWatch}
+          videoWatched={videoWatched[activeCourse] || {}}
+          onVideoEnded={markVideoEnded}
           dashboardUrl={dashboardUrl}
         />
       )}
