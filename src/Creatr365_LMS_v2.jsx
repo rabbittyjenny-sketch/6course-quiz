@@ -353,8 +353,8 @@ const apiSaveScore    = (sid,c,qt,qg,raw,total,pct,passed,lessonId) =>
   api({ action:"save_score", sid, course:c, quiz_type:qt, qg:qg||"", raw, total, pct, passed, lesson_id: lessonId||"" });
 const apiSaveWatch    = (sid,c,l,secs,count) =>
   api({ action:"save_progress", sid, course:c, lesson:l, status:"watching", watch_seconds:secs, watch_count:count });
-const apiSaveSubmit   = (sid,c,rubric,sub_type,url) =>
-  api({ action:"save_submission", sid, course:c, rubric_id:rubric||"", sub_type, url });
+const apiSaveSubmit   = (sid,c,rubric,sub_type,url,lessonId) =>
+  api({ action:"save_submission", sid, course:c, rubric_id:rubric||"", sub_type, url, lesson_id:lessonId||"" });
 
 function normalizeEnrollmentCourses(input) {
   const raw = Array.isArray(input) ? input : [];
@@ -791,7 +791,8 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
         const isLocked = !prevDone && !isDone;
 
         return (
-          <div key={lesson.id} style={{
+          <div key={lesson.id}>
+          <div style={{
             ...S.cardSm,
             display:"flex", alignItems:"center", gap:12,
             opacity: isLocked ? 0.45 : 1,
@@ -861,6 +862,14 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
                 </span>
               )}
             </div>
+          </div>
+          {/* งานที่ส่งประจำบทนี้ (ถ้ากำหนดไว้) — แยกจากคะแนนสอบหลัก ไม่บังคับ
+              ปลดล็อคบทถัดไป เป็นคะแนนเสริมที่แสดงเพิ่มเติมเท่านั้น */}
+          {!isOnsite && lesson.submission?.enabled && prevDone && (
+            <div style={{ marginTop:8, marginBottom:4 }}>
+              <SubmissionCard courseId={courseId} lessonId={lesson.id} sub={lesson.submission} student={student} />
+            </div>
+          )}
           </div>
         );
       })}
@@ -933,14 +942,20 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
 }
 
 // ── Submission Card ───────────────────────────────────────────
-function SubmissionCard({ courseId, sub, student }) {
+// lessonId is optional — when given (a per-lesson submission), the row in
+// `assignments` gets a real module_id so it shows up against that specific
+// lesson (and can be found by module in AdminAssignments) instead of only
+// against the course as a whole. Omitted for the original 3 course-level
+// submissions (FOUNDATION/SIGNAL/BRAND_HOST), which keep behaving exactly
+// as before — this is purely additive for new per-lesson homework.
+function SubmissionCard({ courseId, lessonId, sub, student }) {
   const [url, setUrl] = useState("");
   const [sent, setSent] = useState(false);
 
   async function submit() {
     if (!url.trim()) return;
     const trimmedUrl = url.trim();
-    await apiSaveSubmit(student.id, courseId, sub.rubric, "submission", trimmedUrl);
+    await apiSaveSubmit(student.id, courseId, sub.rubric, "submission", trimmedUrl, lessonId);
     // Also record into Supabase's `assignments` table — the legacy Apps
     // Script call above never reaches AdminAssignments.tsx, the page admins
     // actually use to review/grade submissions.
@@ -954,6 +969,7 @@ function SubmissionCard({ courseId, sub, student }) {
         rubric_id: sub.rubric || "",
         sub_type: "submission",
         url: trimmedUrl,
+        lesson_id: lessonId || "",
       }),
     }).catch(() => {});
     setSent(true);
