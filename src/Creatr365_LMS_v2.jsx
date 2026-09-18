@@ -341,8 +341,7 @@ async function api(params) {
   }
 
   if (params.action === "save_score" && params.sid && params.lesson_id) {
-    const saved = await saveScoreToSupabase(params);
-    if (!saved) return { ...(legacyResult || {}), supabaseSaveFailed: true };
+    await saveScoreToSupabase(params);
   }
   return legacyResult;
 }
@@ -742,8 +741,11 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
         const prevDone = i === 0
           ? (pretestDone || course.pretestCount === 0)
           : lessonStatus[course.lessons[i-1].id] === "done";
-        const hasVideo = !isOnsite && lesson.url && !lesson.url.startsWith("REPLACE");
-        const videoDone = !hasVideo || !!videoWatched[lesson.id];
+        // บังคับดูจนจบเฉพาะคลิปที่ตรวจจับ "จบจริง" ได้ (YouTube เท่านั้นตอนนี้) —
+        // แพลตฟอร์มอื่นที่ตรวจจับไม่ได้ต้องไม่ล็อกแบบทำไม่ได้ตลอดไป จึงถือว่า
+        // "ดูแล้ว" ทันทีที่กดเปิดคลิป เหมือนพฤติกรรมเดิมก่อนแก้จุดนี้
+        const hasDetectableVideo = !isOnsite && isYouTubeEmbed(lesson.url);
+        const videoDone = !hasDetectableVideo || !!videoWatched[lesson.id];
         const canStart = prevDone && status !== "done" && videoDone;
         const isDone   = status === "done";
         const isLocked = !prevDone && !isDone;
@@ -790,7 +792,7 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
               )}
 
               {/* ดูคลิปครบแล้ว ยังไม่ครบ — ต้องดูจบก่อนถึงจะทำแบบทดสอบได้ */}
-              {!isLocked && !isDone && prevDone && hasVideo && !videoDone && (
+              {!isLocked && !isDone && prevDone && hasDetectableVideo && !videoDone && (
                 <span style={{ ...S.muted, fontSize:11 }}>ดูคลิปให้จบก่อน</span>
               )}
 
@@ -1244,7 +1246,6 @@ export default function Creatr365LMS() {
   // เก็บเฉพาะช่วงเซสชันนี้เท่านั้น ยังไม่ได้ persist ลง Supabase ข้ามการ login
   // ใหม่ (ต้องตัดสินใจเรื่อง schema ก่อน — ดูคอมเมนต์ที่ markVideoEnded)
   const [videoWatched, setVideoWatched] = useState({});          // { [courseId]: { [lessonId]: true } }
-  const [saveError, setSaveError] = useState(false);             // save-score ล้มเหลวจริงหลังลองซ้ำแล้ว
   const [activeLesson, setActiveLesson] = useState(null);
   const [quizCtx, setQuizCtx] = useState(null);
   const [alert, setAlert] = useState(null);                     // watch-count alert
@@ -1440,8 +1441,7 @@ export default function Creatr365LMS() {
         const cur = prev[activeCourse] || {};
         return { ...prev, [activeCourse]: { ...cur, "__pretest__": "done" } };
       });
-      apiSaveScore(student?.id, activeCourse, "pretest", quizCtx.qg, result.correct, result.total, result.pct, true)
-        .then(r => { if (r?.supabaseSaveFailed) setSaveError(true); });
+      apiSaveScore(student?.id, activeCourse, "pretest", quizCtx.qg, result.correct, result.total, result.pct, true);
       apiSaveProgress(student?.id, activeCourse, "__pretest__", "done");
       setScreen("course");
       return;
@@ -1459,8 +1459,7 @@ export default function Creatr365LMS() {
     if (passed) {
       markLessonDone(activeLesson, result.pct);
     }
-    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, passed, quizCtx.lessonId)
-      .then(r => { if (r?.supabaseSaveFailed) setSaveError(true); });
+    apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, passed, quizCtx.lessonId);
     setActiveLesson(null);
     setScreen("course");
   }
@@ -1519,15 +1518,6 @@ export default function Creatr365LMS() {
     <div style={S.page} onCopy={e=>e.preventDefault()}>
       <Header student={screen!=="login"?student:null} onLogout={handleLogout} />
 
-      {/* บันทึกคะแนนไป Supabase ไม่สำเร็จ (แม้ลองซ้ำแล้ว) — แจ้งตรงๆ แทนที่จะ
-          ปล่อยให้ผู้เรียนเข้าใจผิดว่าคะแนนที่เห็นบนจอถูกบันทึกแล้ว */}
-      {saveError && (
-        <div style={{ position:"fixed", top:0, left:0, right:0, background:"#C0392B", color:"#fff",
-          padding:"10px 16px", fontSize:13, zIndex:10001, display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
-          <span>⚠ บันทึกคะแนนล่าสุดไปยังระบบไม่สำเร็จ กรุณาถ่ายภาพหน้าจอผลคะแนนไว้ แล้วแจ้งทีมงาน</span>
-          <button onClick={()=>setSaveError(false)} style={{ background:"none", border:"1px solid #fff", color:"#fff", borderRadius:3, padding:"4px 10px", cursor:"pointer", flexShrink:0 }}>ปิด</button>
-        </div>
-      )}
 
       {/* Watch-count alert popup */}
       {alert && (
