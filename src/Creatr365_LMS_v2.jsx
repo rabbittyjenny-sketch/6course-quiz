@@ -187,35 +187,46 @@ function getQsByQG(qgs, phase, count) {
   return count ? pool.slice(0, count) : pool;
 }
 
+// หยิบ `count` ข้อจาก arr แบบต่อคิว วนกลับไปต้นได้ถ้าคิวไม่พอ (ยังกำหนดแน่นอนเสมอ)
+function takeSlice(arr, start, count) {
+  const out = [];
+  for (let i = 0; i < count && arr.length; i++) out.push(arr[(start + i) % arr.length]);
+  return out;
+}
+
 /**
  * ดึงข้อสอบ KC สำหรับแต่ละบท:
  * - ใช้ทุก phase (Pre + During + Post) เพื่อให้มีข้อเยอะพอ
- * - Shuffle ด้วย lesson.id เป็น seed → แต่ละบทได้ข้อต่างกัน
- *   แม้จะมี QG เดียวกัน (เช่น M01,M02,M03 ล้วนเป็น QG-01)
+ * - Shuffle คลังข้อของ QG นั้นด้วย qg เป็น seed ครั้งเดียว แล้วแบ่งเป็นคิวต่อเนื่อง
+ *   ให้แต่ละบทที่ใช้ QG เดียวกัน (เช่น M01,M02,M03) ได้ข้อ "คนละช่วง" ของคิว
+ *   แทนที่จะสุ่มใหม่อิสระต่อบท ซึ่งทำให้ข้อซ้ำกันข้ามบทได้บ่อย
  */
-function getLessonQuiz(lesson) {
+function getLessonQuiz(lesson, course) {
   const pool = QUIZ_BANK.filter(q => q.qg === lesson.qg);
   if (!pool.length) return [];
-  const shuffled = seededShuffle(pool, lesson.id);
-  return shuffled.slice(0, Math.min(5, shuffled.length));
+  const shuffled = seededShuffle(pool, lesson.qg);
+  const sameQgLessons = (course?.lessons || [lesson]).filter(l => l.qg === lesson.qg);
+  const position = Math.max(0, sameQgLessons.findIndex(l => l.id === lesson.id));
+  return takeSlice(shuffled, position * 5, Math.min(5, shuffled.length));
 }
 
 /**
  * ดึงข้อสอบวินิจฉัยรวม (บทสุดท้าย):
- * - ดึงจากทุก QG ของคอร์ส, ทุก phase
- * - Shuffle ด้วย courseId+"_diag" เป็น seed
- * - สูงสุด 15 ข้อ (ครอบคลุมทุกมิติ)
+ * - ดึงจากทุก QG ของคอร์ส กระจายสมดุล สูงสุด 15 ข้อ
+ * - ต่อคิวเดียวกันกับที่บทเรียนของ QG นั้นใช้ไปแล้ว (เริ่มถัดจากข้อสุดท้ายที่บทเรียน
+ *   หยิบไป) เพื่อลดโอกาสได้ข้อซ้ำกับที่เคยทำมาก่อนหน้าให้มากที่สุดเท่าที่คลังข้อมีพอ
  */
 function getDiagnosticQuiz(course) {
   const uniqueQGs = [...new Set(course.lessons.map(l => l.qg).filter(Boolean))];
-  const pool = QUIZ_BANK.filter(q => uniqueQGs.includes(q.qg));
-  const shuffled = seededShuffle(pool, course.id + "_diag");
-  // กระจาย QG — เอาข้อแรกของแต่ละ QG ก่อน ให้ครอบคลุม
-  const byQG = {};
-  shuffled.forEach(q => { if (!byQG[q.qg]) byQG[q.qg] = []; byQG[q.qg].push(q); });
-  const spread = [];
   const max = Math.ceil(15 / uniqueQGs.length);
-  uniqueQGs.forEach(qg => spread.push(...(byQG[qg] || []).slice(0, max)));
+  const spread = [];
+  uniqueQGs.forEach(qg => {
+    const pool = QUIZ_BANK.filter(q => q.qg === qg);
+    if (!pool.length) return;
+    const shuffled = seededShuffle(pool, qg);
+    const lessonsForQg = course.lessons.filter(l => l.qg === qg).length;
+    spread.push(...takeSlice(shuffled, lessonsForQg * 5, Math.min(max, shuffled.length)));
+  });
   return spread.slice(0, 15);
 }
 
@@ -288,30 +299,51 @@ const SLUG_TO_LMS = Object.fromEntries(
   Object.entries(LMS_TO_SLUG).map(([lmsId, slug]) => [slug, lmsId])
 );
 
-async function api(params) {
-  if (!CFG.useApi || APPS_SCRIPT_URL.startsWith("REPLACE")) return null;
+// บันทึกคะแนนจริงลง Supabase (module_progress) — แยกอิสระจากการเรียก Google
+// Apps Script เดิมด้านล่างโดยสิ้นเชิง เพราะเคยพบว่าถ้า Apps Script (ระบบเก่า)
+// ช้า/ล่ม/ถูกบล็อกจากเบราว์เซอร์บางชนิด (เช่น in-app browser ของ LINE) การ
+// throw จาก fetch เส้นนั้นจะทำให้โค้ดไม่มีทางไปถึงการบันทึกคะแนนจริงที่นี่เลย
+// — คะแนนที่ผู้เรียนเห็นบนหน้าจอ (คำนวณฝั่ง client) จึงดูเหมือนบันทึกสำเร็จ
+// ทั้งที่ไม่มีอะไรถูกเขียนลงฐานข้อมูลจริง ลองซ้ำ 1 ครั้งก่อนถือว่าล้มเหลวจริง
+async function saveScoreToSupabase(params, attempt = 1) {
+  const courseSlug = LMS_TO_SLUG[params.course] || String(params.course || "").toLowerCase().replace(/_/g, "-");
   try {
-    const url = new URL(APPS_SCRIPT_URL);
-    Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
-    const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
-    if (params.action === "save_score" && params.sid && params.lesson_id) {
-      // ส่ง course_slug + lesson_id เพื่อให้ save-score หา course_modules.code ได้ถูก
-      const courseSlug = LMS_TO_SLUG[params.course] || String(params.course || "").toLowerCase().replace(/_/g, "-");
-      fetch(SUPABASE_SAVE_SCORE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          student_id: params.sid,
-          course_slug: courseSlug,
-          module_code: params.lesson_id,
-          score: params.pct,
-          passed: params.passed === true || params.passed === "true",
-          quiz_type: params.quiz_type || "",
-        }),
-      }).catch(() => {});
-    }
-    return JSON.parse(await res.text());
-  } catch(e) { console.error("[API]", e); return null; }
+    const res = await fetch(SUPABASE_SAVE_SCORE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        student_id: params.sid,
+        course_slug: courseSlug,
+        module_code: params.lesson_id,
+        score: params.pct,
+        passed: params.passed === true || params.passed === "true",
+        quiz_type: params.quiz_type || "",
+      }),
+    });
+    if (!res.ok) throw new Error(`save-score HTTP ${res.status}: ${await res.text().catch(()=>"")}`);
+    return true;
+  } catch (e) {
+    console.error("[save-score]", e);
+    if (attempt < 2) return saveScoreToSupabase(params, attempt + 1);
+    return false;
+  }
+}
+
+async function api(params) {
+  let legacyResult = null;
+  if (CFG.useApi && !APPS_SCRIPT_URL.startsWith("REPLACE")) {
+    try {
+      const url = new URL(APPS_SCRIPT_URL);
+      Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
+      const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
+      legacyResult = JSON.parse(await res.text());
+    } catch(e) { console.error("[API legacy]", e); }
+  }
+
+  if (params.action === "save_score" && params.sid && params.lesson_id) {
+    await saveScoreToSupabase(params);
+  }
+  return legacyResult;
 }
 
 const apiGetStudent   = sid         => api({ action:"get_student", sid });
@@ -456,11 +488,8 @@ const S = {
   choiceBase: { borderRadius:3, padding:"12px 16px", marginBottom:8, cursor:"pointer", display:"flex", gap:10, alignItems:"flex-start" },
 };
 
-function choiceStyle(sel, correct, show, letter) {
-  if (!show) return { ...S.choiceBase, border: sel===letter?"2px solid #111":"1.5px solid #DDD", background:sel===letter?"#F0F0F0":"#fff" };
-  if (letter===correct) return { ...S.choiceBase, border:"2px solid #1A6B3A", background:"#F0FAF4" };
-  if (sel===letter) return { ...S.choiceBase, border:"2px solid #C0392B", background:"#FDF0F0" };
-  return { ...S.choiceBase, border:"1.5px solid #DDD", background:"#fff", opacity:.6 };
+function choiceStyle(sel, letter) {
+  return { ...S.choiceBase, border: sel===letter?"2px solid #111":"1.5px solid #DDD", background:sel===letter?"#F0F0F0":"#fff" };
 }
 
 // ============================================================
@@ -605,15 +634,66 @@ function Dashboard({ student, enrolledCourses, courseProgress, onSelect, dashboa
   );
 }
 
+// ── YouTube "watched to the end" detection ──────────────────────
+// ใช้ YouTube IFrame Player API (ผ่าน postMessage) เพื่อรู้จริงๆ ว่าคลิปเล่น
+// จบแล้ว ไม่ใช่แค่กดเปิดดู — ใช้ได้เฉพาะคลิปที่ฝังจาก youtube.com/embed/
+// เท่านั้น (URL ทุกอันในระบบตอนนี้เป็น YouTube embed ทั้งหมด) แพลตฟอร์มวิดีโอ
+// อื่นจะไม่มีการตรวจจับนี้ — ปุ่มทำแบบทดสอบจะเปิดได้ทันทีเหมือนเดิมสำหรับบทนั้น
+function isYouTubeEmbed(url) {
+  return typeof url === "string" && /^https:\/\/(www\.)?youtube(-nocookie)?\.com\/embed\//.test(url);
+}
+
+function withYouTubeJsApi(url) {
+  if (!isYouTubeEmbed(url)) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}`;
+}
+
+let youTubeApiPromise = null;
+function loadYouTubeApi() {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (youTubeApiPromise) return youTubeApiPromise;
+  youTubeApiPromise = new Promise((resolve) => {
+    const prevReady = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => { prevReady?.(); resolve(window.YT); };
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(tag);
+  });
+  return youTubeApiPromise;
+}
+
 // ── Course View ───────────────────────────────────────────────
-function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBack, onPretest, onLesson, onSessionUnlock, onViewResults, onWatch, dashboardUrl }) {
+function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBack, onPretest, onLesson, onSessionUnlock, onViewResults, onWatch, videoWatched, onVideoEnded, dashboardUrl }) {
   const course = COURSES[courseId];
   const lessonStatus = allLessonStatus[courseId] || {};
   const lessonScores = allLessonScores[courseId] || {};
   const [playingVideo, setPlayingVideo] = useState(null);
+  const ytPlayerRef = useRef(null);
   const isOnsite = course.type === "onsite";
   const pretestDone = lessonStatus["__pretest__"] === "done";
   const allDone = course.lessons.every(l => lessonStatus[l.id] === "done");
+
+  // ผูก YouTube IFrame Player API กับคลิปที่กำลังเปิดอยู่ เพื่อจับ "เล่นจบจริง"
+  useEffect(() => {
+    if (!playingVideo || !isYouTubeEmbed(playingVideo.url)) return;
+    let cancelled = false;
+    loadYouTubeApi().then(YT => {
+      if (cancelled) return;
+      ytPlayerRef.current = new YT.Player(`yt-frame-${playingVideo.id}`, {
+        events: {
+          onStateChange: (e) => {
+            if (e.data === YT.PlayerState.ENDED) onVideoEnded(playingVideo.id);
+          },
+        },
+      });
+    });
+    return () => {
+      cancelled = true;
+      ytPlayerRef.current?.destroy?.();
+      ytPlayerRef.current = null;
+    };
+  }, [playingVideo]);
 
   return (
     <div style={S.wrap}>
@@ -661,7 +741,12 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
         const prevDone = i === 0
           ? (pretestDone || course.pretestCount === 0)
           : lessonStatus[course.lessons[i-1].id] === "done";
-        const canStart = prevDone && status !== "done";
+        // บังคับดูจนจบเฉพาะคลิปที่ตรวจจับ "จบจริง" ได้ (YouTube เท่านั้นตอนนี้) —
+        // แพลตฟอร์มอื่นที่ตรวจจับไม่ได้ต้องไม่ล็อกแบบทำไม่ได้ตลอดไป จึงถือว่า
+        // "ดูแล้ว" ทันทีที่กดเปิดคลิป เหมือนพฤติกรรมเดิมก่อนแก้จุดนี้
+        const hasDetectableVideo = !isOnsite && isYouTubeEmbed(lesson.url);
+        const videoDone = !hasDetectableVideo || !!videoWatched[lesson.id];
+        const canStart = prevDone && status !== "done" && videoDone;
         const isDone   = status === "done";
         const isLocked = !prevDone && !isDone;
 
@@ -704,6 +789,11 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
               {/* ไอคอนล็อค — แสดงเฉพาะเมื่อบทยังล็อคอยู่จริงๆ */}
               {isLocked && (
                 <span style={{ ...S.muted, fontSize:11 }}>🔒 ล็อค</span>
+              )}
+
+              {/* ดูคลิปครบแล้ว ยังไม่ครบ — ต้องดูจบก่อนถึงจะทำแบบทดสอบได้ */}
+              {!isLocked && !isDone && prevDone && hasDetectableVideo && !videoDone && (
+                <span style={{ ...S.muted, fontSize:11 }}>ดูคลิปให้จบก่อน</span>
               )}
 
               {/* Onsite: กรอกรหัส */}
@@ -766,7 +856,8 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
             </button>
             <div style={{ position:"relative", paddingBottom:"56.25%", height:0, overflow:"hidden", background:"#000" }}>
               <iframe
-                src={playingVideo.url}
+                id={`yt-frame-${playingVideo.id}`}
+                src={withYouTubeJsApi(playingVideo.url)}
                 style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%" }}
                 frameBorder="0"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
@@ -885,7 +976,6 @@ function SessionUnlock({ lesson, courseId, student, onUnlocked, onBack }) {
 function QuizEngine({ questions, title, threshold, courseId, quizType, qg, student, onDone }) {
   const [idx, setIdx] = useState(0);
   const [answers, setAnswers] = useState({});
-  const [showExp, setShowExp] = useState(false);
   const [done, setDone] = useState(false);
   const [result, setResult] = useState(null);
 
@@ -896,18 +986,15 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
   const isFirst = idx === 0;
 
   function select(letter) {
-    if (showExp) return;
     setAnswers(prev => ({ ...prev, [q.id]: letter }));
   }
 
   function prev() {
     if (isFirst) return;
-    setShowExp(false);
     setIdx(i => i - 1);
   }
 
   function next() {
-    setShowExp(false);
     if (isLast) {
       const sc = calcScore(answers, questions);
       setResult(sc);
@@ -990,22 +1077,14 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
         <div style={{ ...S.muted, marginBottom:8 }}>{q.qg}</div>
         <div style={{ fontSize:15, fontWeight:600, marginBottom:18, lineHeight:1.5 }}>{q.q}</div>
         {letters.map(letter => (
-          <div key={letter} style={choiceStyle(sel, q.ans, showExp, letter)} onClick={()=>select(letter)}>
+          <div key={letter} style={choiceStyle(sel, letter)} onClick={()=>select(letter)}>
             <span style={{ width:22, height:22, borderRadius:99, border:"1.5px solid #CCC",
               display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:700, flexShrink:0,
-              background: showExp&&letter===q.ans?"#1A6B3A": showExp&&sel===letter&&letter!==q.ans?"#C0392B":"transparent",
-              color: showExp&&(letter===q.ans||sel===letter)?"#fff":"#555",
-              borderColor: showExp&&letter===q.ans?"#1A6B3A": showExp&&sel===letter&&letter!==q.ans?"#C0392B":"#CCC",
+              color:"#555",
             }}>{letter}</span>
             <span style={{ fontSize:14 }}>{q[letter.toLowerCase()]}</span>
           </div>
         ))}
-        {showExp && (
-          <div style={{ background:"#F8F8F8", border:"1px solid #E5E5E5", borderRadius:3, padding:"12px 14px", marginTop:8 }}>
-            <div style={{ fontSize:11, fontWeight:700, color:"#555", marginBottom:3 }}>อธิบาย</div>
-            <div style={{ fontSize:13, color:"#333", lineHeight:1.6 }}>{q.exp}</div>
-          </div>
-        )}
         <div style={{ display:"flex", gap:10, marginTop:18 }}>
           {/* ปุ่ม Back — ย้อนกลับข้อก่อน */}
           {!isFirst && (
@@ -1014,15 +1093,8 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
             </button>
           )}
 
-          {/* ปุ่มดูเฉลย — แสดงเมื่อมีการเลือกคำตอบแล้ว */}
-          {sel && !showExp && (
-            <button onClick={() => setShowExp(true)} style={S.btnOut}>
-              ดูเฉลย
-            </button>
-          )}
-
-          {(showExp || sel) && (
-            <button onClick={next} disabled={!sel} style={{ ...S.btn, flex: 1 }}>
+          {sel && (
+            <button onClick={next} style={{ ...S.btn, flex: 1 }}>
               {isLast ? "ดูผลลัพธ์ →" : "ข้อถัดไป →"}
             </button>
           )}
@@ -1170,6 +1242,10 @@ export default function Creatr365LMS() {
   const [lessonStatus, setLessonStatus] = useState({});         // { [courseId]: { [lessonId|__pretest__]: "done" } }
   const [lessonScores, setLessonScores] = useState({});         // { [courseId]: { [lessonId]: { qg, pct } } }
   const [watchData, setWatchData] = useState({});               // { lessonId: { count, seconds } }
+  // ต้องดูคลิปจนจบก่อนจึงจะทำแบบทดสอบของบทนั้นได้ (ตามที่ออกแบบไว้แต่แรก) —
+  // เก็บเฉพาะช่วงเซสชันนี้เท่านั้น ยังไม่ได้ persist ลง Supabase ข้ามการ login
+  // ใหม่ (ต้องตัดสินใจเรื่อง schema ก่อน — ดูคอมเมนต์ที่ markVideoEnded)
+  const [videoWatched, setVideoWatched] = useState({});          // { [courseId]: { [lessonId]: true } }
   const [activeLesson, setActiveLesson] = useState(null);
   const [quizCtx, setQuizCtx] = useState(null);
   const [alert, setAlert] = useState(null);                     // watch-count alert
@@ -1312,8 +1388,8 @@ export default function Creatr365LMS() {
       // Diagnostic: ดึงจากทุก QG ของคอร์ส, กระจายสมดุล, สูงสุด 15 ข้อ
       qs = getDiagnosticQuiz(course);
     } else {
-      // KC Quiz: ใช้ seededShuffle ตาม lesson.id → ข้อต่างกันทุกบท
-      qs = getLessonQuiz(lesson);
+      // KC Quiz: ต่อคิวข้อสอบของ QG นี้ตามลำดับบท → ไม่ซ้ำกับบทก่อนหน้า
+      qs = getLessonQuiz(lesson, course);
     }
 
     if (!qs.length) { markLessonDone(lesson, 100); setScreen("course"); return; }
@@ -1396,7 +1472,7 @@ export default function Creatr365LMS() {
   function handleSessionUnlocked(lesson) {
     const course = COURSES[activeCourse];
     const isLast = course.lessons[course.lessons.length-1].id === lesson.id;
-    const qs = isLast ? getDiagnosticQuiz(course) : getLessonQuiz(lesson);
+    const qs = isLast ? getDiagnosticQuiz(course) : getLessonQuiz(lesson, course);
     if (!qs.length) { markLessonDone(lesson, 100); setScreen("course"); return; }
     setActiveLesson(lesson);
     setQuizCtx({
@@ -1425,6 +1501,15 @@ export default function Creatr365LMS() {
     }
   }
 
+  // เรียกเมื่อผู้เล่นวิดีโอ (YouTube) ส่งสถานะ "จบคลิป" มาจริงๆ ผ่าน IFrame
+  // Player API — ปลดล็อกปุ่ม "ทำแบบทดสอบ" ของบทนั้น (เฉพาะเซสชันนี้)
+  function markVideoEnded(lessonId) {
+    setVideoWatched(prev => ({
+      ...prev,
+      [activeCourse]: { ...(prev[activeCourse] || {}), [lessonId]: true },
+    }));
+  }
+
   const activeCourseStatus = lessonStatus[activeCourse] || {};
   const allLessonsDone = activeCourse &&
     COURSES[activeCourse].lessons.every(l => activeCourseStatus[l.id]==="done");
@@ -1432,6 +1517,7 @@ export default function Creatr365LMS() {
   return (
     <div style={S.page} onCopy={e=>e.preventDefault()}>
       <Header student={screen!=="login"?student:null} onLogout={handleLogout} />
+
 
       {/* Watch-count alert popup */}
       {alert && (
@@ -1481,6 +1567,8 @@ export default function Creatr365LMS() {
           onSessionUnlock={lesson=>{setActiveLesson(lesson);setScreen("session_unlock");}}
           onViewResults={()=>setScreen("results")}
           onWatch={recordWatch}
+          videoWatched={videoWatched[activeCourse] || {}}
+          onVideoEnded={markVideoEnded}
           dashboardUrl={dashboardUrl}
         />
       )}
