@@ -132,7 +132,11 @@ const COURSES = {
       { id:"BH7", name:"P&L Mastery & Live Unit Economics",                dur:"วัน 2 · 13:00-15:30", url:null, qg:"QG-07", sessionCode:true, day:2 },
       { id:"BH8", name:"Global Market Intel & Scaling Strategy",           dur:"วัน 2 · 15:30-17:00", url:null, qg:"QG-07", sessionCode:true, day:2 },
     ],
-    submission: { enabled: true, rubric:"RUB-11", label:"ส่ง Scaling Readiness Scorecard + P&L Worksheet" },
+    // RUB-17 (not RUB-11): confirmed 18 ก.ย. 69 that RUB-11 is an EPK
+    // checklist with zero P&L content — mismatched with this label. RUB-11
+    // moved to BH2's onsite trainer scoring instead; RUB-17 was authored to
+    // actually match this worksheet deliverable (see rubrics.ts comment).
+    submission: { enabled: true, rubric:"RUB-17", label:"ส่ง Scaling Readiness Scorecard + P&L Worksheet" },
   },
 };
 
@@ -353,8 +357,8 @@ const apiSaveScore    = (sid,c,qt,qg,raw,total,pct,passed,lessonId) =>
   api({ action:"save_score", sid, course:c, quiz_type:qt, qg:qg||"", raw, total, pct, passed, lesson_id: lessonId||"" });
 const apiSaveWatch    = (sid,c,l,secs,count) =>
   api({ action:"save_progress", sid, course:c, lesson:l, status:"watching", watch_seconds:secs, watch_count:count });
-const apiSaveSubmit   = (sid,c,rubric,sub_type,url) =>
-  api({ action:"save_submission", sid, course:c, rubric_id:rubric||"", sub_type, url });
+const apiSaveSubmit   = (sid,c,rubric,sub_type,url,lessonId) =>
+  api({ action:"save_submission", sid, course:c, rubric_id:rubric||"", sub_type, url, lesson_id:lessonId||"" });
 
 function normalizeEnrollmentCourses(input) {
   const raw = Array.isArray(input) ? input : [];
@@ -634,13 +638,37 @@ function Dashboard({ student, enrolledCourses, courseProgress, onSelect, dashboa
   );
 }
 
-// ── YouTube "watched to the end" detection ──────────────────────
-// ใช้ YouTube IFrame Player API (ผ่าน postMessage) เพื่อรู้จริงๆ ว่าคลิปเล่น
-// จบแล้ว ไม่ใช่แค่กดเปิดดู — ใช้ได้เฉพาะคลิปที่ฝังจาก youtube.com/embed/
-// เท่านั้น (URL ทุกอันในระบบตอนนี้เป็น YouTube embed ทั้งหมด) แพลตฟอร์มวิดีโอ
-// อื่นจะไม่มีการตรวจจับนี้ — ปุ่มทำแบบทดสอบจะเปิดได้ทันทีเหมือนเดิมสำหรับบทนั้น
+// ── "watched to the end" detection — ทุกแพลตฟอร์มวิดีโอ ──────────
+// ต้องดูคลิปจบจริงก่อนทำแบบทดสอบเสมอ ไม่ว่า URL จะมาจากแหล่งไหน วิธีตรวจจับ
+// ต่างกันตามความสามารถของแต่ละแหล่ง:
+//  - YouTube embed  → YouTube IFrame Player API ฟัง event ENDED จริง (แม่นยำสุด)
+//  - ไฟล์วิดีโอตรง (.mp4 ฯลฯ) → <video> tag ในตัว ใช้ event onEnded ของ browser เอง
+//  - อย่างอื่น (เช่น embed จากแพลตฟอร์มที่ไม่มี JS API ให้ฟัง) → ไม่มีทางรู้ตำแหน่ง
+//    เล่นจริง จึงประมาณด้วยการนับเวลาที่เปิดคลิปค้างไว้ขณะแท็บอยู่ในโฟกัส จนครบ
+//    ความยาวที่ระบุใน lesson.dur — เป็น fallback ที่ตรงไปตรงมาที่สุดเท่าที่ทำได้
+//    โดยไม่มี player API จริง ไม่ใช่การตรวจตำแหน่งเล่นแบบ YouTube/<video>
 function isYouTubeEmbed(url) {
   return typeof url === "string" && /^https:\/\/(www\.)?youtube(-nocookie)?\.com\/embed\//.test(url);
+}
+
+function isDirectVideoFile(url) {
+  return typeof url === "string" && /\.(mp4|webm|ogv?|mov)(\?|#|$)/i.test(url);
+}
+
+// "15 นาที" / "1 ชั่วโมง 30 นาที" → วินาที ใช้เป็นเกณฑ์ของโหมด timer fallback
+function parseDurationSeconds(dur) {
+  if (typeof dur !== "string") return null;
+  const h = dur.match(/(\d+)\s*ชั่วโมง/);
+  const m = dur.match(/(\d+)\s*นาที/);
+  if (!h && !m) return null;
+  return (h ? parseInt(h[1], 10) * 3600 : 0) + (m ? parseInt(m[1], 10) * 60 : 0);
+}
+
+function videoWatchMode(lesson) {
+  if (!lesson || !lesson.url || lesson.url.startsWith("REPLACE")) return null;
+  if (isYouTubeEmbed(lesson.url)) return "youtube";
+  if (isDirectVideoFile(lesson.url)) return "html5";
+  return "timer";
 }
 
 function withYouTubeJsApi(url) {
@@ -674,25 +702,41 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
   const pretestDone = lessonStatus["__pretest__"] === "done";
   const allDone = course.lessons.every(l => lessonStatus[l.id] === "done");
 
-  // ผูก YouTube IFrame Player API กับคลิปที่กำลังเปิดอยู่ เพื่อจับ "เล่นจบจริง"
+  // ผูกตัวตรวจจับ "ดูจบจริง" กับคลิปที่กำลังเปิดอยู่ ตาม videoWatchMode() ของคลิปนั้น
+  // (โหมด html5 ใช้ <video onEnded> ในตัว ไม่ต้องมี effect ต่างหาก)
   useEffect(() => {
-    if (!playingVideo || !isYouTubeEmbed(playingVideo.url)) return;
-    let cancelled = false;
-    loadYouTubeApi().then(YT => {
-      if (cancelled) return;
-      ytPlayerRef.current = new YT.Player(`yt-frame-${playingVideo.id}`, {
-        events: {
-          onStateChange: (e) => {
-            if (e.data === YT.PlayerState.ENDED) onVideoEnded(playingVideo.id);
+    if (!playingVideo) return;
+    const mode = videoWatchMode(playingVideo);
+
+    if (mode === "youtube") {
+      let cancelled = false;
+      loadYouTubeApi().then(YT => {
+        if (cancelled) return;
+        ytPlayerRef.current = new YT.Player(`yt-frame-${playingVideo.id}`, {
+          events: {
+            onStateChange: (e) => {
+              if (e.data === YT.PlayerState.ENDED) onVideoEnded(playingVideo.id);
+            },
           },
-        },
+        });
       });
-    });
-    return () => {
-      cancelled = true;
-      ytPlayerRef.current?.destroy?.();
-      ytPlayerRef.current = null;
-    };
+      return () => {
+        cancelled = true;
+        ytPlayerRef.current?.destroy?.();
+        ytPlayerRef.current = null;
+      };
+    }
+
+    if (mode === "timer") {
+      const requiredSec = parseDurationSeconds(playingVideo.dur) || 60;
+      let elapsed = 0;
+      const id = setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        elapsed += 1;
+        if (elapsed >= requiredSec) onVideoEnded(playingVideo.id);
+      }, 1000);
+      return () => clearInterval(id);
+    }
   }, [playingVideo]);
 
   return (
@@ -741,17 +785,18 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
         const prevDone = i === 0
           ? (pretestDone || course.pretestCount === 0)
           : lessonStatus[course.lessons[i-1].id] === "done";
-        // บังคับดูจนจบเฉพาะคลิปที่ตรวจจับ "จบจริง" ได้ (YouTube เท่านั้นตอนนี้) —
-        // แพลตฟอร์มอื่นที่ตรวจจับไม่ได้ต้องไม่ล็อกแบบทำไม่ได้ตลอดไป จึงถือว่า
-        // "ดูแล้ว" ทันทีที่กดเปิดคลิป เหมือนพฤติกรรมเดิมก่อนแก้จุดนี้
-        const hasDetectableVideo = !isOnsite && isYouTubeEmbed(lesson.url);
+        // บังคับดูคลิปจนจบก่อนทำแบบทดสอบเสมอ ไม่ว่า URL จะมาจากแหล่งไหน —
+        // ดู videoWatchMode() ด้านบนสำหรับวิธีตรวจจับของแต่ละแหล่ง
+        const watchMode = !isOnsite ? videoWatchMode(lesson) : null;
+        const hasDetectableVideo = !!watchMode;
         const videoDone = !hasDetectableVideo || !!videoWatched[lesson.id];
         const canStart = prevDone && status !== "done" && videoDone;
         const isDone   = status === "done";
         const isLocked = !prevDone && !isDone;
 
         return (
-          <div key={lesson.id} style={{
+          <div key={lesson.id}>
+          <div style={{
             ...S.cardSm,
             display:"flex", alignItems:"center", gap:12,
             opacity: isLocked ? 0.45 : 1,
@@ -793,7 +838,9 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
 
               {/* ดูคลิปครบแล้ว ยังไม่ครบ — ต้องดูจบก่อนถึงจะทำแบบทดสอบได้ */}
               {!isLocked && !isDone && prevDone && hasDetectableVideo && !videoDone && (
-                <span style={{ ...S.muted, fontSize:11 }}>ดูคลิปให้จบก่อน</span>
+                <span style={{ ...S.muted, fontSize:11 }}>
+                  {watchMode === "timer" ? "เปิดดูคลิปให้ครบตามความยาวก่อน" : "ดูคลิปให้จบก่อน"}
+                </span>
               )}
 
               {/* Onsite: กรอกรหัส */}
@@ -819,6 +866,14 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
                 </span>
               )}
             </div>
+          </div>
+          {/* งานที่ส่งประจำบทนี้ (ถ้ากำหนดไว้) — แยกจากคะแนนสอบหลัก ไม่บังคับ
+              ปลดล็อคบทถัดไป เป็นคะแนนเสริมที่แสดงเพิ่มเติมเท่านั้น */}
+          {!isOnsite && lesson.submission?.enabled && prevDone && (
+            <div style={{ marginTop:8, marginBottom:4 }}>
+              <SubmissionCard courseId={courseId} lessonId={lesson.id} sub={lesson.submission} student={student} />
+            </div>
+          )}
           </div>
         );
       })}
@@ -855,18 +910,33 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
               ×
             </button>
             <div style={{ position:"relative", paddingBottom:"56.25%", height:0, overflow:"hidden", background:"#000" }}>
-              <iframe
-                id={`yt-frame-${playingVideo.id}`}
-                src={withYouTubeJsApi(playingVideo.url)}
-                style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%" }}
-                frameBorder="0"
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                allowFullScreen
-              />
+              {videoWatchMode(playingVideo) === "html5" ? (
+                <video
+                  src={playingVideo.url}
+                  controls
+                  autoPlay
+                  onEnded={() => onVideoEnded(playingVideo.id)}
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%" }}
+                />
+              ) : (
+                <iframe
+                  id={`yt-frame-${playingVideo.id}`}
+                  src={withYouTubeJsApi(playingVideo.url)}
+                  style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%" }}
+                  frameBorder="0"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowFullScreen
+                />
+              )}
             </div>
             <div style={{ background:"#fff", padding:"16px 20px", borderRadius:"0 0 4px 4px" }}>
               <div style={S.h2}>{playingVideo.name}</div>
               <div style={S.muted}>{playingVideo.dur}</div>
+              {videoWatchMode(playingVideo) === "timer" && (
+                <div style={{ ...S.muted, marginTop:6, fontSize:12 }}>
+                  กรุณาเปิดหน้าต่างนี้ค้างไว้จนครบความยาวคลิปโดยไม่สลับไปแท็บอื่น ระบบจะปลดล็อกแบบทดสอบให้อัตโนมัติเมื่อครบเวลา
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -876,14 +946,20 @@ function CourseView({ courseId, student, allLessonStatus, allLessonScores, onBac
 }
 
 // ── Submission Card ───────────────────────────────────────────
-function SubmissionCard({ courseId, sub, student }) {
+// lessonId is optional — when given (a per-lesson submission), the row in
+// `assignments` gets a real module_id so it shows up against that specific
+// lesson (and can be found by module in AdminAssignments) instead of only
+// against the course as a whole. Omitted for the original 3 course-level
+// submissions (FOUNDATION/SIGNAL/BRAND_HOST), which keep behaving exactly
+// as before — this is purely additive for new per-lesson homework.
+function SubmissionCard({ courseId, lessonId, sub, student }) {
   const [url, setUrl] = useState("");
   const [sent, setSent] = useState(false);
 
   async function submit() {
     if (!url.trim()) return;
     const trimmedUrl = url.trim();
-    await apiSaveSubmit(student.id, courseId, sub.rubric, "submission", trimmedUrl);
+    await apiSaveSubmit(student.id, courseId, sub.rubric, "submission", trimmedUrl, lessonId);
     // Also record into Supabase's `assignments` table — the legacy Apps
     // Script call above never reaches AdminAssignments.tsx, the page admins
     // actually use to review/grade submissions.
@@ -897,6 +973,7 @@ function SubmissionCard({ courseId, sub, student }) {
         rubric_id: sub.rubric || "",
         sub_type: "submission",
         url: trimmedUrl,
+        lesson_id: lessonId || "",
       }),
     }).catch(() => {});
     setSent(true);
