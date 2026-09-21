@@ -19,18 +19,29 @@ import {
   PolarRadiusAxis, ResponsiveContainer, Tooltip,
 } from "recharts";
 import { loadQuizBank } from "./quizBank.js";
-import { QG_CATEGORIES, PPACT_KEYS } from "./qgCategories.js";
 
 // ============================================================
 // ⚙️  CONFIG
 // ============================================================
-const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwYnuFfq6E3GsU0fYznj9jrdM6hl3736ET1i3k4iZGCK5-2fyRTjF9ANHaAYdtIgV6XJQ/exec";
+// Z3-7 — endpoints are no longer hardcoded. They come from Vite env vars so a
+// project move / staging environment only needs a .env change, not a code edit.
+// The literals below stay as fallbacks so an un-configured build still runs
+// exactly as before rather than silently failing.
+const ENV = (typeof import.meta !== "undefined" && import.meta.env) || {};
+const SUPABASE_FUNCTIONS_BASE =
+  ENV.VITE_SUPABASE_FUNCTIONS_URL ||
+  "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1";
+const fn = (name) => `${SUPABASE_FUNCTIONS_BASE}/${name}`;
 
-const SUPABASE_ENROLL_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-enrollment";
-const SUPABASE_REDEEM_HANDOFF_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-lms-handoff";
-const SUPABASE_GET_PROGRESS_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/get-progress";
-const SUPABASE_SAVE_SUBMISSION_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/save-submission";
-const SUPABASE_REDEEM_SESSION_URL = "https://exybvjqjdqxonhesydhk.supabase.co/functions/v1/redeem-session-code";
+// Legacy Google Apps Script. Empty string = disabled (see CFG.useLegacyApi).
+const APPS_SCRIPT_URL = ENV.VITE_APPS_SCRIPT_URL || "";
+
+const SUPABASE_ENROLL_URL = fn("get-enrollment");
+const SUPABASE_REDEEM_HANDOFF_URL = fn("redeem-lms-handoff");
+const SUPABASE_GET_PROGRESS_URL = fn("get-progress");
+const SUPABASE_SAVE_SUBMISSION_URL = fn("save-submission");
+const SUPABASE_REDEEM_SESSION_URL = fn("redeem-session-code");
+const SUPABASE_LMS_STATE_URL = fn("lms-state");
 const WEB_APP_REGISTER_URL = ""; // Optional direct-LMS fallback; Dashboard passes returnTo automatically.
 
 const IMG = {
@@ -43,9 +54,12 @@ const IMG = {
 const CFG = {
   passThreshold:   70,   // % เกณฑ์ผ่าน KC Quiz ทุกคอร์ส
   upsellGuard:     80,   // % ถ้าสูงกว่านี้ ไม่แนะนำคอร์สซ้ำ
-  retakeDays:      30,   // วันที่ retake ได้โดยไม่ต้องดูคลิปใหม่
   maxWatchCount:   5,    // ดูซ้ำได้สูงสุดกี่ครั้งก่อนแจ้ง
-  useApi:          true,
+  // Z3-4 — Supabase is the system of record. The legacy Apps Script is now a
+  // write-only mirror that is (a) off unless a URL is configured and (b) never
+  // awaited, so a slow or blocked script can no longer delay or break a save.
+  // `retakeDays` was removed: nothing in the codebase ever read it.
+  useLegacyApi:    !!APPS_SCRIPT_URL,
 };
 
 // ============================================================
@@ -146,22 +160,33 @@ const COURSES = {
 // ต้องตรงกับ SLUG_TO_LMS ใน supabase/functions/get-enrollment/index.ts เสมอ
 const COURSE_ORDER = ["FR_MAGNET", "COURSE_0_FOUNDATION", "COURSE_1_SIGNAL", "COURSE_2_STAGE", "COURSE_3_BRAND_HOST"];
 
-// Radar 5 มิติ
-// สร้างจาก QG_CATEGORIES (qgCategories.js) โดยจัดกลุ่มตาม PPACT key แทนที่
-// จะ hardcode รายชื่อ QG ต่อมิติเอง — เพิ่ม QG ใหม่ที่ qgCategories.js แล้ว
-// มิตินี้จะดึงเข้ามาเองอัตโนมัติ ไม่ต้องแก้ 2 ที่
-const RADAR_LABELS = {
-  communication: "Hook & FOMO",
-  presence:      "เสียง/กล้อง",
-  psychology:    "จิตวิทยา",
-  authority:     "Data & ธุรกิจ",
-  trust:         "Brand/จรรยาบรรณ",
-};
-const RADAR_DIMS = PPACT_KEYS.map(key => ({
-  key,
-  label: RADAR_LABELS[key],
-  qgs: Object.keys(QG_CATEGORIES).filter(qg => QG_CATEGORIES[qg].ppact === key),
-}));
+// ============================================================
+// 🎯  PPACT — Creator Transformation System (5 มิติ มาตรฐานเดียวของระบบ)
+// ------------------------------------------------------------
+// เดิมระบบมี "5 มิติ" อยู่ 3 ชุดที่ไม่ตรงกัน (radar ในคอร์ส / AC-TB-EI-DO-ST
+// ในแบบประเมินก่อนเรียน / PPACT ในหนังสือเรียนและ FAQ) ทำให้ผู้เรียนเห็นตัวเลข
+// คนละชุดและใบประกาศอ้างคำที่ไม่ตรงกับหน้าจอ
+//
+// ยึด PPACT เป็นมาตรฐานเดียว เพราะเป็นชุดที่ถูกพิมพ์อยู่ในหนังสือเรียนแล้ว
+// (SIGNAL Module 0.2, FOUNDATION, ARCHITECT) และอยู่ในถ้อยคำของใบประกาศ
+// — แก้โค้ดถูกกว่าพิมพ์หนังสือใหม่
+//
+// key เดิม (hook/voice/psych/data/brand) ยังถูกเก็บไว้ใน legacyKey เพื่อให้
+// ข้อมูลที่เคยบันทึกไว้ยังอ่านออก
+//
+// trust.qgs ได้ QG-08/09/10 เพิ่มเข้ามา 2569-09-21 — แยกออกจาก QG-06 เดิม
+// หลัง audit เนื้อหารายบทพบว่า QG-06 ปนกัน 3 เรื่องที่ไม่เกี่ยวกัน (จรรยาบรรณ/
+// กฎหมาย, ตัวตนโฮสต์แบบบุคลิก, ตัวตนโฮสต์แบบบทบาทธุรกิจ) กับ Brand/Production
+// จริง — รายละเอียดราย QG ดู qgCategories.js, ต้องตรงกับ QG_CATEGORIES ที่นั่น
+// และกับ src/lib/ppact.ts ของเว็บหลักเสมอ
+// ============================================================
+const RADAR_DIMS = [
+  { key:"presence",      legacyKey:"voice", letter:"P", en:"Presence",      label:"Presence", labelTh:"การปรากฏตัวหน้ากล้อง",        qgs:["QG-03"] },
+  { key:"psychology",    legacyKey:"psych", letter:"P", en:"Psychology",    label:"Psychology", labelTh:"จิตวิทยาการโน้มน้าว",          qgs:["QG-04"] },
+  { key:"authority",     legacyKey:"data",  letter:"A", en:"Authority",     label:"Authority", labelTh:"ข้อมูลและธุรกิจ",    qgs:["QG-05","QG-07"] },
+  { key:"communication", legacyKey:"hook",  letter:"C", en:"Communication", label:"Communication", labelTh:"การสื่อสารที่ตรึงคนดู",     qgs:["QG-01","QG-02"] },
+  { key:"trust",         legacyKey:"brand", letter:"T", en:"Trust",         label:"Trust", labelTh:"ความไว้วางใจและจรรยาบรรณ",           qgs:["QG-06","QG-08","QG-09","QG-10"] },
+];
 
 const HOST_LEVELS = [
   { min:0,  max:40,  label:"เริ่มต้น",          badge:"STARTER" },
@@ -172,9 +197,13 @@ const HOST_LEVELS = [
 ];
 
 // ============================================================
-// 📝  QUIZ BANK — 81 ข้อ MCQ + True/False (auto-grade)
-// โหลดจริงจาก Supabase (`quiz_bank`, ~166 ข้อ) ตอนแอปเริ่มทำงาน — ชุดนี้
-// เป็นแค่ fallback เผื่อโหลดจาก Supabase ไม่สำเร็จ (ดู quizBank.js)
+// 📝  QUIZ BANK — เดิมนับได้ 81 ข้อ (QG-01:16, QG-02:8, QG-03:9, QG-04:9,
+// QG-05:16, QG-06:10, QG-07:13) — MCQ + True/False (auto-grade)
+// โหลดจริงจาก Supabase (`quiz_bank`, ~166 ข้อ ครอบคลุม QG-01..07) ตอน
+// แอปเริ่มทำงาน — ชุดข้างล่างนี้เป็นแค่ fallback เผื่อโหลดจาก Supabase
+// ไม่สำเร็จ (ดู quizBank.js). QG-08/09/10 ยังไม่มีข้อจริงทั้งใน Supabase
+// และในชุด fallback นี้ — ดู Bible ภาคผนวก Z2.1 สำหรับแผนเดิมที่ตั้งใจ
+// ไว้ 116 ข้อ
 // ============================================================
 const QUIZ_BANK_FALLBACK = [{"id":"QG01-PRE-A-001","qg":"QG-01","phase":"Pre","type":"MCQ","q":"คนดู TikTok ใช้เวลาเฉลี่ยกี่วินาทีก่อนตัดสินใจเลื่อนผ่าน?","a":"8 วินาที","b":"2.3 วินาที","c":"15 วินาที","d":"30 วินาที","ans":"B","exp":"สถิติ Attention Economy 2025-2026 ระบุว่าใช้เวลาเพียง 2.3 วินาที","rec":"FR_MAGNET,COURSE_0_FOUNDATION,COURSE_1_SIGNAL","lvl":"STARTER"},{"id":"QG01-PRE-A-002","qg":"QG-01","phase":"Pre","type":"MCQ","q":"\"Attention Economy\" ในบริบท Live Commerce หมายถึงอะไร?","a":"การใช้เงินซื้อโฆษณา","b":"การแย่งชิงความสนใจของผู้ชมในเวลาไม่กี่วินาที","c":"การวิเคราะห์ตลาด","d":"การสร้าง Content ยาว","ans":"B","exp":"Live Commerce ต้องแย่งชิงความสนใจจากแพลตฟอร์มอื่น ในเวลาสั้นมาก","rec":"COURSE_1_SIGNAL","lvl":"STARTER"},{"id":"QG01-PRE-A-003","qg":"QG-01","phase":"Pre","type":"MCQ","q":"เหตุผลหลักที่ Live Conversion Rate สูงกว่า Website คือ?","a":"สินค้าราคาถูกกว่า","b":"การโต้ตอบ Real-time + FOMO","c":"โฆษณาเยอะกว่า","d":"ผู้ชมเยอะกว่า","ans":"B","exp":"การโต้ตอบสดและความรู้สึกเร่งด่วน (FOMO) ทำให้คนตัดสินใจซื้อเร็วกว่า","rec":"FR_MAGNET,COURSE_0_FOUNDATION","lvl":"STARTER"},{"id":"QG01-PRE-A-004","qg":"QG-01","phase":"Pre","type":"MCQ","q":"ถ้า Live CR = 18% และ Website CR = 1.5% — Live สูงกว่ากี่เท่า?","a":"6 เท่า","b":"8 เท่า","c":"12 เท่า","d":"18 เท่า","ans":"C","exp":"18 ÷ 1.5 = 12 เท่า","rec":"FR_MAGNET,COURSE_0_FOUNDATION","lvl":"STARTER"},{"id":"QG01-PRE-A-005","qg":"QG-01","phase":"Pre","type":"MCQ","q":"\"Hook Loop\" คืออะไร?","a":"การเปิดเพลงระหว่างไลฟ์","b":"การปล่อย Mini Hook ทุก 15-20 นาที","c":"การหยุดพักระหว่างไลฟ์","d":"การโฆษณาสินค้าซ้ำๆ","ans":"B","exp":"Hook Loop คือการปล่อย Mini Hook ทุก 15-20 นาที เพื่อดึงผู้ชมที่เริ่มเบื่อกลับมา","rec":"FR_MAGNET,COURSE_0_FOUNDATION,COURSE_1_SIGNAL","lvl":"STARTER"},{"id":"QG01-PRE-B-001","qg":"QG-01","phase":"Pre","type":"MCQ","q":"ถ้า Live CR = 12% และ Website CR = 1.2% — อัตราส่วน Live:Website คือ?","a":"5:1","b":"8:1","c":"10:1","d":"12:1","ans":"C","exp":"12 ÷ 1.2 = 10 เท่า","rec":"FR_MAGNET,COURSE_0_FOUNDATION","lvl":"STARTER"},{"id":"QG01-PRE-B-002","qg":"QG-01","phase":"Pre","type":"MCQ","q":"ข้อใดเป็นตัวอย่าง Curiosity Hook ที่ดีสำหรับครีมกันแดด?","a":"\"ครีมกันแดดดีที่สุดของปี\"","b":"\"ทำไมครีม 590 บ. ถึงขายดีกว่าตัว 2,000 บ.?\"","c":"\"สวัสดีค่ะ มาดูครีมนี้กัน\"","d":"\"ลด 50% วันนี้วันเดียว\"","ans":"B","exp":"Curiosity Hook ต้องทำให้คนสงสัยและอยากรู้คำตอบทันที","rec":"COURSE_1_SIGNAL","lvl":"STARTER"},{"id":"QG01-PRE-B-003","qg":"QG-01","phase":"Pre","type":"MCQ","q":"ข้อใดไม่ใช่ลักษณะของ Grabber ที่ดี?","a":"ชี้ปัญหาที่ผู้ชมกำลังเผชิญ","b":"ใช้ตัวเลขสถิติ","c":"ยาวเกิน 10 วินาที","d":"สร้างความอยากรู้","ans":"C","exp":"Grabber ต้องสั้น กระชับ ไม่เกิน 3-5 วินาที","rec":"COURSE_1_SIGNAL","lvl":"STARTER"},{"id":"QG01-PRE-B-004","qg":"QG-01","phase":"Pre","type":"True_False","q":"True/False: คนดู TikTok ตัดสินใจเลื่อนผ่านภายใน 8 วินาที","a":"TRUE","b":"FALSE","c":"","d":"","ans":"B","exp":"False — ใช้เวลาเพียง 2.3 วินาทีเท่านั้น (Attention Economy 2025-2026)","rec":"FR_MAGNET,COURSE_0_FOUNDATION","lvl":"STARTER"},{"id":"QG01-DUR-A-001","qg":"QG-01","phase":"During","type":"MCQ","q":"ใน 3 วินาทีแรก โฮสต์ต้องทำอะไรเป็นอันดับแรก?","a":"บอกชื่อสินค้า","b":"ขอบคุณที่เข้ามาดู","c":"หยุดนิ้วผู้ชมด้วยประโยค Grabber","d":"แนะนำตัวเอง","ans":"C","exp":"3 วินาทีแรกต้องสร้างเหตุผลให้ผู้ชมอยู่ดูต่อ ไม่ใช่แนะนำตัว","rec":"","lvl":"STARTER"},{"id":"QG01-DUR-A-002","qg":"QG-01","phase":"During","type":"MCQ","q":"\"ภูมิแพ้กำลังทำลายชีวิตคุณ มาดูทางออก\" — คือ Hook ประเภทใด?","a":"Benefit Hook","b":"Urgency Hook","c":"Pain Hook","d":"Social Proof Hook","ans":"C","exp":"Pain Hook คือการชี้ปัญหาที่ผู้ชมกำลังเผชิญอยู่","rec":"","lvl":"STARTER"},{"id":"QG01-DUR-A-003","qg":"QG-01","phase":"During","type":"MCQ","q":"Hook Loop ควรปล่อยห่างทุกกี่นาที?","a":"5-10 นาที","b":"15-20 นาที","c":"25-30 นาที","d":"30-40 นาที","ans":"B","exp":"ทุก 15-20 นาที เพื่อดึงคนที่เริ่มเบื่อกลับมา","rec":"","lvl":"STARTER"},{"id":"QG01-POST-A-002","qg":"QG-01","phase":"Post","type":"MCQ","q":"[คำนวณ] ไลฟ์ 60 นาที Hook Loop ทุก 15 นาที — ต้องปล่อยกี่ครั้ง?","a":"3 ครั้ง","b":"4 ครั้ง","c":"5 ครั้ง","d":"6 ครั้ง","ans":"B","exp":"ที่นาทีที่ 0, 15, 30, 45 รวม 4 ครั้ง","rec":"","lvl":"STARTER"},{"id":"QG01-POST-A-004","qg":"QG-01","phase":"Post","type":"MCQ","q":"[คำนวณ] ไลฟ์ 90 นาที Hook Loop ทุก 18 นาที — จะปล่อยกี่ครั้ง?","a":"4 ครั้ง","b":"5 ครั้ง","c":"6 ครั้ง","d":"7 ครั้ง","ans":"B","exp":"ที่นาทีที่ 0, 18, 36, 54, 72 รวม 5 ครั้ง","rec":"","lvl":"STARTER"},{"id":"QG01-POST-A-006","qg":"QG-01","phase":"Post","type":"MCQ","q":"[จับคู่] 'ทำไมครีม 590 บ. ขายดีกว่าตัว 2,000 บ.?' — เป็น Hook ประเภทใด?","a":"Pain Hook","b":"Benefit Hook","c":"Curiosity Hook","d":"Urgency Hook","ans":"C","exp":"ตั้งคำถามให้อยากรู้คำตอบ = Curiosity Hook","rec":"","lvl":"STARTER"},{"id":"QG01-POST-A-007","qg":"QG-01","phase":"Post","type":"MCQ","q":"[ระบุ] ไลฟ์ 45 นาที Hook Loop ทุก 15 นาที — ควรปล่อยกี่ครั้ง?","a":"2 ครั้ง","b":"3 ครั้ง","c":"4 ครั้ง","d":"5 ครั้ง","ans":"B","exp":"ที่นาทีที่ 0, 15, 30 รวม 3 ครั้ง","rec":"","lvl":"STARTER"},{"id":"QG02-PRE-A-001","qg":"QG-02","phase":"Pre","type":"MCQ","q":"FOMO Ladder ขั้นที่ 1 ทำหน้าที่อะไร?","a":"Countdown Timer","b":"Price Anchor — แสดงราคาเต็มก่อนบอกราคาลด","c":"Scarcity","d":"Social Proof","ans":"B","exp":"ขั้นที่ 1 คือการสร้าง Price Anchor ให้ผู้ชมเห็นว่า 'ลดจากราคาเท่าไร'","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"DEVELOPING"},{"id":"QG02-PRE-A-002","qg":"QG-02","phase":"Pre","type":"MCQ","q":"สีที่จิตวิทยาแนะนำให้ใช้กับ Flash Sale Badge คือ?","a":"สีส้ม","b":"สีเหลือง","c":"สีแดง #FF0000","d":"สีน้ำเงิน","ans":"C","exp":"สีแดงกระตุ้น Arousal สูงสุด ทำให้ผู้ชมรู้สึกเร่งด่วน","rec":"","lvl":"DEVELOPING"},{"id":"QG02-PRE-A-003","qg":"QG-02","phase":"Pre","type":"MCQ","q":"FOMO Ladder ขั้นที่ 3 สร้างอะไร?","a":"Countdown Timer","b":"ราคาอ้างอิง","c":"Scarcity (ความขาดแคลน)","d":"Social Proof","ans":"C","exp":"เหลือแค่ 12 ชิ้น!' สร้างความรู้สึกว่าต้องรีบก่อนหมด","rec":"","lvl":"DEVELOPING"},{"id":"QG02-PRE-A-004","qg":"QG-02","phase":"Pre","type":"MCQ","q":"Voucher Stacking (Affiliate + Seller Voucher) ให้ผลอะไรต่อ Algorithm?","a":"+5% Boost","b":"+10% Boost","c":"+15% Algorithm Boost","d":"+20% Boost","ans":"C","exp":"Voucher Stacking ส่งสัญญาณให้ Algorithm ว่า live กำลัง active","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"DEVELOPING"},{"id":"QG02-PRE-A-005","qg":"QG-02","phase":"Pre","type":"True_False","q":"True/False: Flash Sale Badge ที่กะพริบ 0.8 วินาที ช่วยเพิ่ม Conversion","a":"TRUE","b":"FALSE","c":"","d":"","ans":"A","exp":"True — การกะพริบสร้าง Arousal และดึงดูดสายตา","rec":"","lvl":"DEVELOPING"},{"id":"QG02-POST-A-002","qg":"QG-02","phase":"Post","type":"MCQ","q":"[คำนวณ] CR ปัจจุบัน 2% หลังใช้ FOMO ครบ 4 ขั้น (+247%) — CR ใหม่จะเป็นเท่าไร?","a":"4.94%","b":"5.47%","c":"6.94%","d":"8.47%","ans":"C","exp":"2% × (1+2.47) = 2% × 3.47 = 6.94%","rec":"","lvl":"DEVELOPING"},{"id":"QG02-POST-A-003","qg":"QG-02","phase":"Post","type":"MCQ","q":"[จับคู่] ขั้น FOMO กับหน้าที่ — ขั้น 2 คือ?","a":"Price Anchor","b":"Urgency (Countdown)","c":"Scarcity","d":"Social Proof","ans":"B","exp":"ขั้น 2 = Urgency — ใช้ Countdown Timer สร้างความเร่งด่วน","rec":"","lvl":"DEVELOPING"},{"id":"QG02-POST-A-004","qg":"QG-02","phase":"Post","type":"True_False","q":"True/False: ควรใช้ Countdown ที่เป็นเท็จเพื่อสร้าง Urgency","a":"TRUE","b":"FALSE","c":"","d":"","ans":"B","exp":"False — ทำลาย Trust ระยะยาว ผู้ชมจะรู้สึกถูกหลอก","rec":"","lvl":"DEVELOPING"},{"id":"QG03-PRE-A-001","qg":"QG-03","phase":"Pre","type":"MCQ","q":"Strategic Pause ใช้ตอนไหน?","a":"เมื่อลืมสคริปต์","b":"หยุด 1-2 วินาทีก่อนบอกราคา/ข้อเสนอสำคัญ","c":"เมื่อเสียงหาย","d":"หลังพูดครบ 5 นาที","ans":"B","exp":"Strategic Pause สร้าง Anticipation ทำให้ผู้ชมรอฟังด้วยความตั้งใจ","rec":"COURSE_1_SIGNAL,COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG03-PRE-A-002","qg":"QG-03","phase":"Pre","type":"MCQ","q":"Source Credibility มี 3 มิติ — ข้อใดไม่ใช่?","a":"Expertise","b":"Trustworthiness","c":"Attractiveness","d":"Popularity","ans":"D","exp":"Source Credibility (Hovland 1953) = Expertise + Trustworthiness + Attractiveness","rec":"COURSE_1_SIGNAL","lvl":"COMPETENT"},{"id":"QG03-PRE-A-003","qg":"QG-03","phase":"Pre","type":"MCQ","q":"Dead Air ที่ยอมรับได้ในการ Live คือไม่เกินกี่วินาที?","a":"1 วินาที","b":"2 วินาที","c":"3 วินาที","d":"5 วินาที","ans":"C","exp":"Dead Air เกิน 3 วินาที ผู้ชมจะรู้สึก awkward และออกจาก live","rec":"COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG03-PRE-A-004","qg":"QG-03","phase":"Pre","type":"MCQ","q":"Whisper Trick ใช้เพื่อ?","a":"พูดช้าลง","b":"ลด Dead Air และดึงความสนใจในช่วงสำคัญ","c":"ประหยัดเสียง","d":"แสดงว่ามีความลับ","ans":"B","exp":"Whisper Trick = พูดเบาลงในช่วงสำคัญ สร้าง Intimacy และดึงความสนใจ","rec":"COURSE_1_SIGNAL,COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG03-PRE-A-005","qg":"QG-03","phase":"Pre","type":"MCQ","q":"Eye-line ที่ถูกต้องคือ?","a":"มองหน้าจอโทรศัพท์","b":"มองกล้อง (เลนส์) ตลอด","c":"มองรายชื่อผู้ชม","d":"มองบนเพดาน","ans":"B","exp":"มองกล้องโดยตรง = สร้าง Eye Contact กับผู้ชมทุกคนพร้อมกัน","rec":"COURSE_1_SIGNAL,COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG03-PRE-A-006","qg":"QG-03","phase":"Pre","type":"True_False","q":"True/False: Vocal Dynamics หมายถึงการพูดเสียงดังตลอดเวลา","a":"TRUE","b":"FALSE","c":"","d":"","ans":"B","exp":"False — Vocal Dynamics = การเปลี่ยน Tone/Pace/Volume อย่างมีเป้าหมาย","rec":"COURSE_1_SIGNAL","lvl":"COMPETENT"},{"id":"QG03-PRE-A-007","qg":"QG-03","phase":"Pre","type":"MCQ","q":"Diaphragmatic Breathing ช่วยอะไรในการ Live?","a":"ทำให้หน้าแดง","b":"ควบคุม Tone/Pace ได้นาน ไม่เหนื่อยเร็ว","c":"ลด Dead Air","d":"เพิ่ม CR","ans":"B","exp":"การหายใจด้วยกระบังลมช่วยให้เสียงมีพลัง และ Live ได้นานโดยไม่เสียงหาย","rec":"COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG03-POST-A-001","qg":"QG-03","phase":"Post","type":"MCQ","q":"Champion Stance คือท่าไหน?","a":"นั่งพิงหลัง","b":"ยืนตรง ไหล่ผาย มือผ่อนคลาย พร้อมโน้มตัวหาผู้ชม","c":"ยืนมือไขว้หลัง","d":"นั่งขาไขว้","ans":"B","exp":"Champion Stance สื่อความมั่นใจ เปิดรับ และพร้อม Engage ผู้ชม","rec":"COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG03-POST-A-002","qg":"QG-03","phase":"Post","type":"True_False","q":"True/False: 15-5-3 Rule หมายถึงระยะโน้มตัวเข้าหากล้อง 3 ระดับ","a":"TRUE","b":"FALSE","c":"","d":"","ans":"A","exp":"True — 15cm สำหรับปกติ, 5cm สำหรับข้อเสนอสำคัญ, 3cm สำหรับ Whisper","rec":"COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG04-PRE-A-001","qg":"QG-04","phase":"Pre","type":"MCQ","q":"PAD Theory ย่อมาจากอะไร?","a":"Price-Audience-Design","b":"Pleasure-Arousal-Dominance","c":"Push-Attract-Drive","d":"Product-Appeal-Delivery","ans":"B","exp":"PAD (Mehrabian 1974) = Pleasure (ความพอใจ) + Arousal (ความตื่นตัว) + Dominance (ความควบคุม)","rec":"COURSE_1_SIGNAL,COURSE_3_BRAND_HOST","lvl":"COMPETENT"},{"id":"QG04-PRE-A-002","qg":"QG-04","phase":"Pre","type":"MCQ","q":"S-O-R Framework ย่อมาจาก?","a":"Sales-Order-Result","b":"Stimulus-Organism-Response","c":"Show-Offer-Revenue","d":"Story-Objective-Return","ans":"B","exp":"S-O-R = Stimulus (สิ่งกระตุ้น) → Organism (กระบวนการในตัวผู้ซื้อ) → Response (การตอบสนอง)","rec":"COURSE_1_SIGNAL","lvl":"COMPETENT"},{"id":"QG04-PRE-A-003","qg":"QG-04","phase":"Pre","type":"MCQ","q":"4 Color Styles ในการอ่านลูกค้า — ลูกค้าสีแดงมีพฤติกรรมอย่างไร?","a":"ต้องการข้อมูลครบก่อนตัดสินใจ","b":"ตัดสินใจเร็ว ชอบผลลัพธ์ชัดเจน","c":"ต้องการสังคมและความสนุก","d":"ชอบความสัมพันธ์และ Trust","ans":"B","exp":"สีแดง = Driver — ตัดใจเร็ว ต้องการผลลัพธ์ ไม่ชอบรายละเอียดยาว","rec":"COURSE_2_STAGE,COURSE_3_BRAND_HOST","lvl":"COMPETENT"},{"id":"QG04-PRE-A-004","qg":"QG-04","phase":"Pre","type":"True_False","q":"True/False: Flow State ในการ Live คือสภาวะที่ผู้ชม engage อย่างเต็มที่โดยไม่รู้สึกว่าเวลาผ่าน","a":"TRUE","b":"FALSE","c":"","d":"","ans":"A","exp":"True — Flow State (Csikszentmihalyi) = immersive engagement ที่ Host ต้องสร้างให้เกิด","rec":"COURSE_1_SIGNAL,COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG04-PRE-A-005","qg":"QG-04","phase":"Pre","type":"MCQ","q":"ลูกค้าที่ถามมาก ต้องการข้อมูล ชอบข้อเท็จจริง — เป็นสีไหน?","a":"สีแดง","b":"สีเหลือง","c":"สีน้ำเงิน","d":"สีเขียว","ans":"C","exp":"สีน้ำเงิน = Analytical — ต้องการข้อมูลครบ ตัดสินใจช้าแต่มั่นใจ","rec":"COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG04-PRE-A-006","qg":"QG-04","phase":"Pre","type":"MCQ","q":"Arousal ใน PAD Model เกี่ยวข้องกับ Flash Sale อย่างไร?","a":"ลด Arousal ทำให้คนซื้อ","b":"เพิ่ม Arousal ด้วย FOMO → ตัดสินใจเร็วขึ้น","c":"Arousal ไม่มีผลต่อการซื้อ","d":"Arousal สูง ทำให้คนออกจาก live","ans":"B","exp":"Arousal สูง = ตื่นตัว ตัดสินใจเร็ว — Flash Sale + Countdown เพิ่ม Arousal โดยตรง","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"COMPETENT"},{"id":"QG04-POST-A-001","qg":"QG-04","phase":"Post","type":"MCQ","q":"Objection Handling — ลูกค้าพูดว่า 'แพงไป' ควรตอบอย่างไรก่อน?","a":"ลดราคาทันที","b":"ยืนยันคุณค่าก่อน จากนั้นเสนอ Option","c":"เถียงว่าราคานี้ถูกแล้ว","d":"เพิกเฉย","ans":"B","exp":"Acknowledge Value ก่อน = รับรู้ความรู้สึก → เชื่อม Value → เสนอทางออก","rec":"COURSE_2_STAGE,COURSE_3_BRAND_HOST","lvl":"COMPETENT"},{"id":"QG04-POST-A-002","qg":"QG-04","phase":"Post","type":"True_False","q":"True/False: ASBC Technique ย่อมาจาก Attention-Story-Benefit-CTA","a":"TRUE","b":"FALSE","c":"","d":"","ans":"A","exp":"True — ASBC = โครงสร้างการนำเสนอที่ครบวงจรใน Live Commerce","rec":"COURSE_2_STAGE","lvl":"COMPETENT"},{"id":"QG04-POST-A-003","qg":"QG-04","phase":"Post","type":"MCQ","q":"Flow State จะเกิดเมื่อไหร่?","a":"เมื่อ Host พูดเร็วมาก","b":"เมื่อ Challenge และ Skill สมดุลกัน — ยากพอดี ไม่น่าเบื่อ ไม่เครียด","c":"เมื่อมีสินค้าให้ดูเยอะ","d":"เมื่อ Host แจกของรางวัล","ans":"B","exp":"Flow State เกิดเมื่อ Challenge ≈ Skill — ผู้ชมรู้สึก engaged โดยไม่รู้ตัว","rec":"COURSE_2_STAGE,COURSE_3_BRAND_HOST","lvl":"COMPETENT"},{"id":"QG05-PRE-A-001","qg":"QG-05","phase":"Pre","type":"MCQ","q":"GMV ย่อมาจากอะไร?","a":"General Market Value","b":"Gross Merchandise Value","c":"Global Media Volume","d":"Growth Metric Value","ans":"B","exp":"GMV = Gross Merchandise Value = ยอดขายรวมก่อนหักค่าใช้จ่าย","rec":"FR_MAGNET,COURSE_0_FOUNDATION,COURSE_1_SIGNAL","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-002","qg":"QG-05","phase":"Pre","type":"MCQ","q":"CR (Conversion Rate) คำนวณจากอะไร?","a":"(จำนวนออร์เดอร์ ÷ จำนวนผู้ชม) × 100","b":"(ยอดขาย ÷ ค่าโฆษณา) × 100","c":"จำนวนผู้ชมสูงสุด ÷ เวลา","d":"(GMV ÷ CCV) × 100","ans":"A","exp":"CR% = (Orders ÷ Viewers) × 100 — ตัววัดประสิทธิภาพการขายหลัก","rec":"FR_MAGNET,COURSE_0_FOUNDATION,COURSE_1_SIGNAL","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-003","qg":"QG-05","phase":"Pre","type":"MCQ","q":"AOV ย่อมาจากอะไร?","a":"Average Order Volume","b":"Average Online Viewers","c":"Average Order Value","d":"Algorithm Optimization Value","ans":"C","exp":"AOV = Average Order Value = มูลค่าเฉลี่ยต่อออร์เดอร์ = GMV ÷ จำนวนออร์เดอร์","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-004","qg":"QG-05","phase":"Pre","type":"MCQ","q":"[คำนวณ] ไลฟ์ได้ GMV 50,000 บ. มี 40 ออร์เดอร์ — AOV คือ?","a":"1,000 บ.","b":"1,250 บ.","c":"1,500 บ.","d":"2,000 บ.","ans":"B","exp":"AOV = 50,000 ÷ 40 = 1,250 บ.","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-005","qg":"QG-05","phase":"Pre","type":"MCQ","q":"Live Score 4 ปัจจัยของ TikTok คือ?","a":"CCV, Watch Time, GMV/CCV, Comment Rate","b":"Views, Likes, Shares, Comments","c":"Followers, Following, Posts, Lives","d":"Reach, Impression, CTR, CPM","ans":"A","exp":"TikTok Live Score = CCV + Watch Time% + GMV/CCV + Comment Rate — 4 ตัวนี้ขับ algorithm","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-006","qg":"QG-05","phase":"Pre","type":"MCQ","q":"[คำนวณ] ผู้ชม 500 คน ออร์เดอร์ 25 ใบ — CR คือ?","a":"2%","b":"5%","c":"8%","d":"10%","ans":"B","exp":"CR = 25 ÷ 500 × 100 = 5%","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-007","qg":"QG-05","phase":"Pre","type":"MCQ","q":"Retention Curve คือกราฟอะไร?","a":"กราฟแสดงยอดขายรายวัน","b":"กราฟแสดงสัดส่วนผู้ชมที่ยังอยู่ดูเมื่อเวลาผ่านไป","c":"กราฟแสดง Follower Growth","d":"กราฟเปรียบเทียบ Live กับ VOD","ans":"B","exp":"Retention Curve = วัดว่านาทีไหนผู้ชมออก → หาจุดที่ต้องปรับ Hook Loop","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION,COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-008","qg":"QG-05","phase":"Pre","type":"MCQ","q":"Golden Minute คือ?","a":"นาทีที่ยอดขายสูงสุด","b":"ช่วงนาทีที่ Retention Curve ชันลงมากที่สุด — จุดที่ต้องวาง Hook Loop","c":"นาทีแรกของ live","d":"นาทีที่ผู้ชมเยอะสุด","ans":"B","exp":"Golden Minute = ช่วงที่ต้องใส่ Hook ก่อนผู้ชมออกจำนวนมาก — ดึงกลับได้มากที่สุด","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION,COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-009","qg":"QG-05","phase":"Pre","type":"MCQ","q":"[คำนวณ] GMV 80,000 บ. CCV เฉลี่ย 200 คน — GMV/CCV คือ?","a":"200 บ.","b":"300 บ.","c":"400 บ.","d":"500 บ.","ans":"C","exp":"GMV/CCV = 80,000 ÷ 200 = 400 บ. — ตัววัดว่าผู้ชม 1 คน generate รายได้เท่าไร","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-010","qg":"QG-05","phase":"Pre","type":"True_False","q":"True/False: Watch Time ≥30% หมายความว่าผู้ชมอยู่ดูนานกว่า 30 วินาที","a":"TRUE","b":"FALSE","c":"","d":"","ans":"A","exp":"True — SIGNAL กำหนด Watch Time ≥30% ของผู้ชมอยู่ดูนานกว่า 30 วินาที","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-PRE-A-011","qg":"QG-05","phase":"Pre","type":"MCQ","q":"[คำนวณ] Live Score = CCV(30)+WatchTime(25)+GMV/CCV(15)+Comment(5) = ?","a":"65","b":"70","c":"75","d":"80","ans":"C","exp":"30+25+15+5 = 75 (Live Score >75 คือเกณฑ์ผ่านของ MATRIX)","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-POST-A-001","qg":"QG-05","phase":"Post","type":"MCQ","q":"[คำนวณ] ผู้ชม 1,200 คน ออร์เดอร์ 35 ใบ — CR คือ?","a":"2.4%","b":"2.9%","c":"3.2%","d":"3.8%","ans":"B","exp":"CR = 35 ÷ 1,200 × 100 = 2.92% ≈ 2.9%","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION,COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG05-POST-A-002","qg":"QG-05","phase":"Post","type":"MCQ","q":"[คำนวณ] GMV จากราคาเฉลี่ย 650 บ. ออร์เดอร์ 35 ใบ = ?","a":"19,250 บ.","b":"21,000 บ.","c":"22,750 บ.","d":"24,500 บ.","ans":"C","exp":"GMV = 35 × 650 = 22,750 บ.","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION,COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG05-POST-A-004","qg":"QG-05","phase":"Post","type":"MCQ","q":"[Live Score] CCV=120, WatchTime=40%, GMV/CCV=120 บ., Comment=4% — ระดับไหน?","a":"ต่ำกว่า 50","b":"50-65","c":"66-75","d":"สูงกว่า 75","ans":"D","exp":"Watch Time 40% + Comment 4% + GMV/CCV 120 บ. ดีทุกด้าน — Live Score >75","rec":"COURSE_1_SIGNAL,COURSE_0_FOUNDATION","lvl":"PROFICIENT"},{"id":"QG05-POST-A-005","qg":"QG-05","phase":"Post","type":"MCQ","q":"Net Margin ที่เหมาะสมใน Live Commerce คือ?","a":"5-10%","b":"10-15%","c":"20-30%","d":"40-50%","ans":"C","exp":"Net Margin 20-30% คือ target ที่ FRONTIER สอน — ต่ำกว่า 20% ถือว่าควรปรับ model","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG05-POST-A-006","qg":"QG-05","phase":"Post","type":"MCQ","q":"ROAS ย่อมาจาก?","a":"Return on Ad Spend","b":"Reach of Average Sessions","c":"Revenue on All Sales","d":"Rate of Audience Satisfaction","ans":"A","exp":"ROAS = ทุก 1 บ. ที่จ่ายโฆษณา ได้รายได้กลับมากี่บ.","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG06-PRE-A-001","qg":"QG-06","phase":"Pre","type":"MCQ","q":"ใน Live Commerce ทีม Production มีกี่บทบาทหลัก?","a":"2 บทบาท","b":"3 บทบาท","c":"4 บทบาท","d":"5 บทบาท","ans":"C","exp":"Host / Producer / Chat Mod / Inventory — 4 บทบาทหลักในทีม Live Production","rec":"COURSE_2_STAGE,COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-002","qg":"QG-06","phase":"Pre","type":"MCQ","q":"5 Hidden Souls คือ?","a":"5 ประเภทผู้ชม","b":"5 บุคลิกหลักที่โฮสต์ดึงมาใช้หน้ากล้อง","c":"5 ขั้นตอนการขาย","d":"5 Platform ที่ต้องไลฟ์","ans":"B","exp":"5 Hidden Souls = นักแสดง / วาทยากร / นักจิตวิทยา / ผู้เชี่ยวชาญ / สถาปนิก","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-003","qg":"QG-06","phase":"Pre","type":"MCQ","q":"Brand CI ย่อมาจาก?","a":"Brand Content Index","b":"Brand Corporate Identity","c":"Brand Creative Intelligence","d":"Brand Customer Interface","ans":"B","exp":"Brand CI = Corporate Identity — ระบบที่ทำให้แบรนด์มีความสม่ำเสมอในทุกจุดสัมผัส","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-004","qg":"QG-06","phase":"Pre","type":"MCQ","q":"EPK ย่อมาจาก?","a":"Electronic Press Kit","b":"Event Planning Kit","c":"Engagement Performance KPI","d":"Extended Product Knowledge","ans":"A","exp":"EPK = Electronic Press Kit — เอกสารแนะนำตัวโฮสต์สำหรับแบรนด์ใหญ่","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-005","qg":"QG-06","phase":"Pre","type":"MCQ","q":"หน้าที่ Chat Mod ในทีม Live คือ?","a":"ควบคุมกล้อง","b":"ตอบ Comment + กรอง Spam + แจ้ง Host สิ่งสำคัญ","c":"จัดสต็อกสินค้า","d":"ดูแลไฟและแสง","ans":"B","exp":"Chat Mod ต้องตอบภายใน 30 วินาที + กรอง Negative + Pass Key Info ให้ Host","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-006","qg":"QG-06","phase":"Pre","type":"MCQ","q":"OBS ใช้สำหรับ?","a":"วิเคราะห์ข้อมูล","b":"สร้าง Script","c":"Software สำหรับ Streaming หลายกล้อง/Overlay","d":"จัดการ LINE OA","ans":"C","exp":"OBS = Open Broadcaster Software — ใช้สำหรับ Multi-camera Live + Graphic Overlay","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-007","qg":"QG-06","phase":"Pre","type":"True_False","q":"True/False: Host ที่ดีไม่จำเป็นต้องมี Brand Identity ชัดเจน","a":"TRUE","b":"FALSE","c":"","d":"","ans":"B","exp":"False — Brand Memory เกิดจาก Identity ที่สม่ำเสมอ แบรนด์ใหญ่จ้างโฮสต์ที่จำได้","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-PRE-A-008","qg":"QG-06","phase":"Pre","type":"MCQ","q":"Marketing Mix 7Ps — P ตัวที่ 7 คือ?","a":"Positioning","b":"People, Process, Physical Evidence","c":"Performance","d":"Promotion","ans":"B","exp":"7Ps = Product/Price/Place/Promotion + People/Process/Physical Evidence","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-POST-A-001","qg":"QG-06","phase":"Post","type":"MCQ","q":"Hand Signal ในทีม Live ใช้เมื่อ?","a":"เมื่อต้องการพักเบรก","b":"สื่อสารระหว่าง Host กับทีม โดยไม่รบกวนการ Live","c":"เมื่อสินค้าหมด","d":"เมื่อ CCV ตก","ans":"B","exp":"Hand Signal = ระบบสื่อสารเงียบ ทำให้การ Live ดูราบรื่น ผู้ชมไม่รู้ว่ามีการประสานงาน","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG06-POST-A-002","qg":"QG-06","phase":"Post","type":"MCQ","q":"Soul หลักของโฮสต์ควรมีกี่ Soul?","a":"1 Soul (Soul เดียว)","b":"Soul หลัก 1 + Soul รอง 1-2","c":"ใช้ทั้ง 5 เท่าๆ กัน","d":"เลือกตาม Mood แต่ละวัน","ans":"B","exp":"Soul หลัก 1 = เอกลักษณ์ + Soul รอง 1-2 = ความยืดหยุ่น ไม่กระจัดกระจาย","rec":"COURSE_3_BRAND_HOST","lvl":"PROFICIENT"},{"id":"QG07-PRE-A-001","qg":"QG-07","phase":"Pre","type":"MCQ","q":"Net Margin ที่เหมาะสมใน Live Commerce คือ?","a":"5-10%","b":"10-15%","c":"20-30%","d":"40-50%","ans":"C","exp":"Net Margin 20-30% — Platform fees 6-9% + Affiliate 10-20% + Ad Spend","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-PRE-A-002","qg":"QG-07","phase":"Pre","type":"MCQ","q":"Platform Fee ของ TikTok Shop โดยทั่วไปอยู่ที่?","a":"1-3%","b":"3-5%","c":"6-9%","d":"10-15%","ans":"C","exp":"TikTok Shop Platform Fee 6-9% ขึ้นกับ category + seller tier","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-PRE-A-003","qg":"QG-07","phase":"Pre","type":"MCQ","q":"Smart Lazy Strategy หมายถึง?","a":"ทำงานน้อยลง ขายน้อยลง","b":"ระบบที่ขยายรายได้โดยไม่เพิ่มชั่วโมงทำงาน","c":"การใช้ AI แทนทุกอย่าง","d":"การจ้าง Team ใหญ่","ans":"B","exp":"Smart Lazy = ไลฟ์สูงสุด 3 วัน/สัปดาห์ + ขยายด้วย Content Repurpose + AI Automation","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-PRE-A-004","qg":"QG-07","phase":"Pre","type":"MCQ","q":"Affiliate Commission ใน Live Commerce อยู่ที่เท่าไรโดยทั่วไป?","a":"1-5%","b":"5-8%","c":"10-20%","d":"25-30%","ans":"C","exp":"Affiliate Commission 10-20% ขึ้นกับแบรนด์และ category สินค้า","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-PRE-A-005","qg":"QG-07","phase":"Pre","type":"MCQ","q":"Break-even GMV คือ?","a":"GMV ที่สูงที่สุด","b":"GMV ขั้นต่ำที่ต้องทำเพื่อไม่ขาดทุน","c":"GMV เฉลี่ย 3 เดือน","d":"GMV target สำหรับ KOL","ans":"B","exp":"Break-even = Fixed Cost + Variable Cost ÷ Net Margin% — รู้แล้วตั้งเป้าได้ถูก","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-001","qg":"QG-07","phase":"Post","type":"MCQ","q":"Content Pillar คือ?","a":"เสาค้ำกล้อง","b":"หัวข้อหลักที่ใช้ผลิต Content ซ้ำได้อย่างสม่ำเสมอ","c":"ยอดผู้ชมสูงสุด","d":"จำนวน Live ต่อเดือน","ans":"B","exp":"Content Pillar = 3-5 หัวข้อหลักที่ตอบ Audience Pain Point → ผลิตได้ไม่รู้จบ","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-002","qg":"QG-07","phase":"Post","type":"MCQ","q":"LTV (Lifetime Value) ในบริบทโฮสต์คือ?","a":"อายุการทำงาน","b":"รายได้รวมที่ลูกค้า 1 คนสร้างให้ตลอดความสัมพันธ์","c":"จำนวน Live ทั้งหมด","d":"ยอด Follower รวม","ans":"B","exp":"LTV for Host = รายได้จากแบรนด์ที่จ้างซ้ำ × ระยะเวลาความสัมพันธ์","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-003","qg":"QG-07","phase":"Post","type":"MCQ","q":"ตลาด Global ที่มี Live Commerce เติบโตเร็วที่สุด (2025-2026) คือ?","a":"Europe","b":"US","c":"Southeast Asia + China","d":"Middle East","ans":"C","exp":"SEA + China = Live Commerce mainstream — US/EU ยังอยู่ช่วง Early Adopter","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-004","qg":"QG-07","phase":"Post","type":"MCQ","q":"Localization ≠ Translation หมายความว่า?","a":"ใช้ AI แปลภาษา","b":"ปรับเนื้อหาให้เหมาะกับวัฒนธรรมท้องถิ่น ไม่ใช่แค่แปลคำ","c":"ใช้ภาษาอังกฤษตลอด","d":"จ้าง Translator มืออาชีพ","ans":"B","exp":"Localization = เข้าใจ Culture/Pain Point ของแต่ละตลาด → ปรับ Script/Tone ให้ตรง","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-005","qg":"QG-07","phase":"Post","type":"MCQ","q":"IMC ย่อมาจาก?","a":"International Marketing Campaign","b":"Integrated Marketing Communications","c":"Internal Management Control","d":"Intelligent Media Content","ans":"B","exp":"IMC = ทุก Channel สื่อสาร Consistent Message — TikTok + LINE OA + IG + Threads","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-006","qg":"QG-07","phase":"Post","type":"True_False","q":"True/False: โฮสต์ที่ดีควรไลฟ์ทุกวันเพื่อสร้าง consistency","a":"TRUE","b":"FALSE","c":"","d":"","ans":"B","exp":"False — Smart Lazy Strategy แนะนำ ≤3 วัน/สัปดาห์ เน้น Quality ไม่ใช่ Quantity","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-007","qg":"QG-07","phase":"Post","type":"MCQ","q":"[คำนวณ] GMV 200,000 บ. Platform Fee 8% Affiliate 15% Ad 5% — Net Revenue คือ?","a":"114,000 บ.","b":"124,000 บ.","c":"144,000 บ.","d":"154,000 บ.","ans":"C","exp":"Net Revenue = 200,000 × (1-0.08-0.15-0.05) = 200,000 × 0.72 = 144,000 บ.","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"},{"id":"QG07-POST-A-008","qg":"QG-07","phase":"Post","type":"MCQ","q":"Thought Leadership ในบริบทโฮสต์คือ?","a":"การเป็น KOL ที่มี Followers เยอะ","b":"การสร้างความน่าเชื่อถือในฐานะผู้รู้จริงด้านนั้น → แบรนด์หาแทนที่ไม่ได้","c":"การเขียนหนังสือ","d":"การพูด TED Talk","ans":"B","exp":"Thought Leader = ความรู้ + ประสบการณ์จริง + Content สม่ำเสมอ = Brand Authority","rec":"COURSE_3_BRAND_HOST","lvl":"MASTER"}];
 
@@ -205,9 +234,16 @@ function seededShuffle(arr, seed) {
   return result;
 }
 
-function getQsByQG(qgs, phase, count) {
-  let pool = QUIZ_BANK.filter(q => qgs.includes(q.qg) && q.phase === phase);
-  return count ? pool.slice(0, count) : pool;
+function getQsByQG(qgs, phase, count, seed) {
+  // Z2.2 — the pre-test used to take the first N questions straight off the
+  // bank in file order, so every learner on a course saw an identical,
+  // easily-shared list. It now uses the same deterministic shuffle as the
+  // Knowledge Checks: different learners/courses get different orders, while
+  // the *same* learner retaking the same pre-test still sees the same set
+  // (fair, and reproducible for support).
+  const pool = QUIZ_BANK.filter(q => qgs.includes(q.qg) && q.phase === phase);
+  const ordered = seed ? seededShuffle(pool, seed) : pool;
+  return count ? ordered.slice(0, count) : ordered;
 }
 
 // หยิบ `count` ข้อจาก arr แบบต่อคิว วนกลับไปต้นได้ถ้าคิวไม่พอ (ยังกำหนดแน่นอนเสมอ)
@@ -239,14 +275,19 @@ function getLessonQuiz(lesson, course) {
  * - ต่อคิวเดียวกันกับที่บทเรียนของ QG นั้นใช้ไปแล้ว (เริ่มถัดจากข้อสุดท้ายที่บทเรียน
  *   หยิบไป) เพื่อลดโอกาสได้ข้อซ้ำกับที่เคยทำมาก่อนหน้าให้มากที่สุดเท่าที่คลังข้อมีพอ
  */
-function getDiagnosticQuiz(course) {
+function getDiagnosticQuiz(course, attemptNumber = 1) {
   const uniqueQGs = [...new Set(course.lessons.map(l => l.qg).filter(Boolean))];
   const max = Math.ceil(15 / uniqueQGs.length);
   const spread = [];
+  // attemptNumber > 1 (a retake) mixes the attempt number into the seed so a
+  // learner who retakes per the Completion Record Framework §4.2 ("สุ่มข้อสอบ
+  // รอบสอบแก้ด้วย seed ต่างจากรอบก่อนหน้า") sees a different slice of the
+  // question pool instead of the identical set they just reviewed.
+  const seedSuffix = attemptNumber > 1 ? `|attempt${attemptNumber}` : "";
   uniqueQGs.forEach(qg => {
     const pool = QUIZ_BANK.filter(q => q.qg === qg);
     if (!pool.length) return;
-    const shuffled = seededShuffle(pool, qg);
+    const shuffled = seededShuffle(pool, qg + seedSuffix);
     const lessonsForQg = course.lessons.filter(l => l.qg === qg).length;
     spread.push(...takeSlice(shuffled, lessonsForQg * 5, Math.min(max, shuffled.length)));
   });
@@ -270,7 +311,7 @@ function buildRadar(lessonScores) {
   return RADAR_DIMS.map(d => {
     const vals = d.qgs.flatMap(qg => qgScores[qg] || [0]);
     const avg = vals.length ? Math.round(vals.reduce((a,b)=>a+b,0)/vals.length) : 0;
-    return { dim:d.key, label:d.label, value:avg };
+    return { dim:d.key, label:d.label, labelTh:d.labelTh, letter:d.letter, value:avg };
   });
 }
 
@@ -341,39 +382,61 @@ async function saveScoreToSupabase(params, attempt = 1) {
         score: params.pct,
         passed: params.passed === true || params.passed === "true",
         quiz_type: params.quiz_type || "",
+        radar_breakdown: params.radar_breakdown || undefined,
       }),
     });
-    if (!res.ok) throw new Error(`save-score HTTP ${res.status}: ${await res.text().catch(()=>"")}`);
-    return true;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(`save-score HTTP ${res.status}: ${JSON.stringify(body)}`);
+    return body;
   } catch (e) {
     console.error("[save-score]", e);
     if (attempt < 2) return saveScoreToSupabase(params, attempt + 1);
-    return false;
+    return null;
+  }
+}
+
+/** Learner pressed "ยืนยันรับผล" — Completion Record Framework §4.1 step 4. */
+async function acceptDiagnosticAttempt(studentId, attemptId) {
+  try {
+    const res = await fetch(SUPABASE_SAVE_SCORE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ student_id: studentId, action: "accept_diagnostic", attempt_id: attemptId }),
+    });
+    return await res.json().catch(() => null);
+  } catch (e) {
+    console.error("[accept_diagnostic]", e);
+    return null;
   }
 }
 
 async function api(params) {
   let legacyResult = null;
-  if (CFG.useApi && !APPS_SCRIPT_URL.startsWith("REPLACE")) {
+  // Z3-4 — fire-and-forget. Previously this was awaited, so whenever Apps
+  // Script was slow or blocked (notably inside the LINE in-app browser) the
+  // whole save path stalled behind it. Supabase is the record of truth; the
+  // mirror must never be on the critical path.
+  if (CFG.useLegacyApi) {
     try {
       const url = new URL(APPS_SCRIPT_URL);
       Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, String(v)));
-      const res = await fetch(url.toString(), { method:"GET", redirect:"follow" });
-      legacyResult = JSON.parse(await res.text());
-    } catch(e) { console.error("[API legacy]", e); }
+      fetch(url.toString(), { method:"GET", redirect:"follow", keepalive:true })
+        .catch(e => console.warn("[API legacy mirror]", e));
+    } catch(e) { console.warn("[API legacy mirror]", e); }
   }
 
+  let saveResult = null;
   if (params.action === "save_score" && params.sid && params.lesson_id) {
-    await saveScoreToSupabase(params);
+    saveResult = await saveScoreToSupabase(params);
   }
-  return legacyResult;
+  return params.action === "save_score" ? saveResult : legacyResult;
 }
 
 const apiGetStudent   = sid         => api({ action:"get_student", sid });
 const apiGetEnroll    = sid         => api({ action:"get_enrollment", sid });
 const apiSaveProgress = (sid,c,l,s) => api({ action:"save_progress", sid, course:c, lesson:l, status:s });
-const apiSaveScore    = (sid,c,qt,qg,raw,total,pct,passed,lessonId) =>
-  api({ action:"save_score", sid, course:c, quiz_type:qt, qg:qg||"", raw, total, pct, passed, lesson_id: lessonId||"" });
+const apiSaveScore    = (sid,c,qt,qg,raw,total,pct,passed,lessonId,radarBreakdown) =>
+  api({ action:"save_score", sid, course:c, quiz_type:qt, qg:qg||"", raw, total, pct, passed, lesson_id: lessonId||"", radar_breakdown: radarBreakdown });
 const apiSaveWatch    = (sid,c,l,secs,count) =>
   api({ action:"save_progress", sid, course:c, lesson:l, status:"watching", watch_seconds:secs, watch_count:count });
 const apiSaveSubmit   = (sid,c,rubric,sub_type,url,lessonId) =>
@@ -430,24 +493,80 @@ async function resolveEnrollment(id) {
 // rows (via get-progress) instead of the LMS starting every login with
 // every lesson locked from #1 — verified against production that this was
 // happening on every single login, even minutes after finishing lessons,
-// because nothing ever read progress back. Pretest completion is NOT
-// included here: it was only ever written to the old Apps Script backend
-// (apiSaveProgress), never to Supabase, so there is nothing real to
-// rehydrate it from yet — a returning student still redoes the pretest,
-// which only costs a few minutes since it has no pass/fail gate of its own.
-async function resolveProgress(studentId, enrolledCourseIds) {
-  const empty = { lessonStatus: {}, lessonScores: {}, courseProgress: {} };
+// because nothing ever read progress back.
+//
+// Z2.2 / Z3-8 — pre-test completion and "video watched" are now persisted
+// server-side too (table lms_lesson_state, via the lms-state function) and
+// rehydrated here. Before this, both lived only in React state: a learner who
+// logged out after watching a clip had to sit through it again, and the
+// pre-test had to be redone on every single login.
+async function fetchLessonState(studentId) {
   try {
-    const res = await fetch(SUPABASE_GET_PROGRESS_URL, {
+    const res = await fetch(SUPABASE_LMS_STATE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "get", student_id: studentId }),
+    });
+    if (!res.ok) return {};
+    const { state } = await res.json();
+    return state || {};
+  } catch (e) {
+    console.warn("[lms-state get]", e);
+    return {};
+  }
+}
+
+// Fire-and-forget writer. Never awaited on the UI path: if it fails the
+// learner simply falls back to the old session-only behaviour.
+function saveLessonState(studentId, payload) {
+  if (!studentId) return;
+  try {
+    fetch(SUPABASE_LMS_STATE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ student_id: studentId, ...payload }),
+      keepalive: true,
+    }).catch(e => console.warn("[lms-state set]", e));
+  } catch (e) { console.warn("[lms-state set]", e); }
+}
+
+async function resolveProgress(studentId, enrolledCourseIds) {
+  const empty = { lessonStatus: {}, lessonScores: {}, courseProgress: {}, videoWatched: {}, watchCounts: {} };
+  // Both calls are independent; run them together so login stays fast.
+  const [progressRes, lessonState] = await Promise.all([
+    fetch(SUPABASE_GET_PROGRESS_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ student_id: studentId }),
-    });
-    if (!res.ok) return empty;
-    const { progress } = await res.json();
-    if (!progress) return empty;
+    }).catch(() => null),
+    fetchLessonState(studentId),
+  ]);
 
-    const lessonStatus = {};
+  // Pre-test + watched-video state survives even if get-progress fails.
+  const videoWatched = {};
+  const watchCounts = {};
+  const pretestDone = {};
+  Object.entries(lessonState).forEach(([courseId, st]) => {
+    if (st?.pretestDone) pretestDone[courseId] = true;
+    Object.entries(st?.videos || {}).forEach(([lessonId, v]) => {
+      if (v?.watched) {
+        if (!videoWatched[courseId]) videoWatched[courseId] = {};
+        videoWatched[courseId][lessonId] = true;
+      }
+      if (v?.views) {
+        if (!watchCounts[courseId]) watchCounts[courseId] = {};
+        watchCounts[courseId][lessonId] = v.views;
+      }
+    });
+  });
+
+  try {
+    const res = progressRes;
+    if (!res || !res.ok) return { ...empty, videoWatched, watchCounts, lessonStatus: pretestToStatus(pretestDone) };
+    const { progress } = await res.json();
+    if (!progress) return { ...empty, videoWatched, watchCounts, lessonStatus: pretestToStatus(pretestDone) };
+
+    const lessonStatus = pretestToStatus(pretestDone);
     const lessonScores = {};
     const courseProgress = {};
 
@@ -457,7 +576,9 @@ async function resolveProgress(studentId, enrolledCourseIds) {
       const byModule = slug ? progress[slug] : null;
       if (!course || !byModule) return;
 
-      const statusForCourse = {};
+      // Start from whatever the pre-test rehydration already established for
+      // this course so the "__pretest__" marker is not wiped out below.
+      const statusForCourse = { ...(lessonStatus[courseId] || {}) };
       const scoresForCourse = {};
       let doneCount = 0;
       course.lessons.forEach(lesson => {
@@ -468,18 +589,25 @@ async function resolveProgress(studentId, enrolledCourseIds) {
           doneCount++;
         }
       });
-      if (doneCount > 0) {
+      if (doneCount > 0 || Object.keys(statusForCourse).length > 0) {
         lessonStatus[courseId] = statusForCourse;
         lessonScores[courseId] = scoresForCourse;
         courseProgress[courseId] = { lessonsCompleted: doneCount };
       }
     });
 
-    return { lessonStatus, lessonScores, courseProgress };
+    return { lessonStatus, lessonScores, courseProgress, videoWatched, watchCounts };
   } catch (e) {
     console.error("[get-progress]", e);
-    return empty;
+    return { ...empty, videoWatched, watchCounts, lessonStatus: pretestToStatus(pretestDone) };
   }
+}
+
+/** { COURSE_ID: true } -> { COURSE_ID: { __pretest__: "done" } } */
+function pretestToStatus(pretestDone) {
+  const out = {};
+  Object.keys(pretestDone).forEach(courseId => { out[courseId] = { __pretest__: "done" }; });
+  return out;
 }
 
 // ============================================================
@@ -1144,7 +1272,7 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
           <div style={{ display:"flex", gap:10, marginTop:18, flexWrap:"wrap" }}>
             {!passed && threshold > 0 && (
               <>
-                <button onClick={()=>{setIdx(0);setAnswers({});setDone(false);setResult(null);setShowExp(false);}}
+                <button onClick={()=>{setIdx(0);setAnswers({});setDone(false);setResult(null);}}
                   style={{ ...S.btnOut, flex:1 }}>ทำใหม่ (Retake)</button>
                 <button onClick={()=>onDone(result)} style={{ ...S.btn, flex:1, background:"#888" }}>
                   จบการทดสอบ (ไม่สอบซ่อม)
@@ -1194,6 +1322,73 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
               {isLast ? "ดูผลลัพธ์ →" : "ข้อถัดไป →"}
             </button>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Diagnostic Review — accept or retake (Completion Record Framework §4.1) ─
+// The diagnostic quiz itself never blocks anything (see QuizEngine, threshold
+// 0). What happens AFTER it is what the framework is strict about: the
+// learner — not the system — decides whether this score becomes the one that
+// backs their completion record for the course, and a completion record is
+// never issued without that explicit decision.
+function DiagnosticReviewScreen({ pending, accepting, outcome, onAccept, onRetake, onDone }) {
+  const { result } = pending;
+
+  // After acceptDiagnosticAttempt() has answered:
+  if (outcome) {
+    const issued = outcome.issued === true;
+    return (
+      <div style={{ ...S.wrap, maxWidth:560, paddingTop:40 }}>
+        <div style={S.card}>
+          <div style={{ textAlign:"center", padding:"14px 0" }}>
+            <div style={{ fontSize:40, marginBottom:8 }}>{issued ? "🎓" : "✓"}</div>
+            <div style={{ fontSize:18, fontWeight:700, marginBottom:6 }}>
+              {issued ? "ออกใบบันทึกการเรียนจบแล้ว" : "บันทึกผลของคุณแล้ว"}
+            </div>
+            {issued ? (
+              <div style={{ ...S.muted, lineHeight:1.6 }}>
+                ผลคะแนนแบบประเมินทักษะ {result.pct}% ถูกบันทึกเป็นค่าที่แสดงบนใบเรียบร้อย
+                ดูใบบันทึกการเรียนจบได้ที่ MY STUDIO
+              </div>
+            ) : (
+              <div style={{ ...S.muted, lineHeight:1.6 }}>
+                ระบบบันทึกผลแล้ว แต่ยังไม่สามารถออกใบได้ในตอนนี้
+                {outcome.reason ? <> — เหตุผล: <span style={{ fontFamily:"monospace" }}>{outcome.reason}</span></> : null}
+                <br />โดยทั่วไปแปลว่ายังเรียนไม่ครบทุกบทในคอร์สนี้ ลองอีกครั้งหลังเรียนจบครบทุกบท
+              </div>
+            )}
+          </div>
+          <button onClick={onDone} style={{ ...S.btn, width:"100%", marginTop:14 }}>
+            ดูผลลัพธ์คอร์ส →
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // The decision prompt itself.
+  return (
+    <div style={{ ...S.wrap, maxWidth:560, paddingTop:40 }}>
+      <div style={S.card}>
+        <div style={{ textAlign:"center", padding:"14px 0" }}>
+          <div style={{ fontSize:28, fontWeight:700, marginBottom:4 }}>{result.pct}%</div>
+          <div style={S.muted}>{result.correct} จาก {result.total} ข้อ — แบบประเมินวินิจฉัย</div>
+        </div>
+        <hr style={S.divider} />
+        <div style={{ fontSize:14, lineHeight:1.7, marginBottom:16 }}>
+          พอใจกับคะแนนนี้ไหมคะ? ถ้ายืนยัน คะแนนนี้จะถูกใช้ออกใบบันทึกการเรียนจบทันที (ถ้าเรียนจบครบทุกบทแล้ว)
+          หรือจะลองทำแบบประเมินใหม่อีกครั้งก็ได้ — ทำได้ไม่จำกัดจำนวนครั้ง ระบบจะสลับข้อสอบชุดใหม่ให้ทุกครั้ง
+        </div>
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          <button onClick={onRetake} disabled={accepting} style={{ ...S.btnOut, flex:1 }}>
+            ทำแบบประเมินใหม่
+          </button>
+          <button onClick={onAccept} disabled={accepting} style={{ ...S.btn, flex:1 }}>
+            {accepting ? "กำลังบันทึก..." : "ยืนยันรับผลนี้"}
+          </button>
         </div>
       </div>
     </div>
@@ -1250,7 +1445,10 @@ function CourseResults({ courseId, student, lessonScores, enrolledCourses, onBac
         <div style={{ marginBottom:18 }}>
           {radar.map(d => (
             <div key={d.dim} style={{ display:"flex", alignItems:"center", gap:10, marginBottom:7 }}>
-              <div style={{ width:90, fontSize:12, color:"#555", flexShrink:0 }}>{d.label}</div>
+              <div style={{ width:130, flexShrink:0 }}>
+                <div style={{ fontSize:12, color:"#333", fontWeight:600 }}>{d.letter} · {d.label}</div>
+                <div style={{ fontSize:10, color:"#888", lineHeight:1.25 }}>{d.labelTh}</div>
+              </div>
               <div style={S.barBg}><div style={S.barFill(d.value)} /></div>
               <div style={{ width:34, fontSize:12, color:"#555", textAlign:"right" }}>{d.value}%</div>
             </div>
@@ -1338,13 +1536,18 @@ export default function Creatr365LMS() {
   const [lessonStatus, setLessonStatus] = useState({});         // { [courseId]: { [lessonId|__pretest__]: "done" } }
   const [lessonScores, setLessonScores] = useState({});         // { [courseId]: { [lessonId]: { qg, pct } } }
   const [watchData, setWatchData] = useState({});               // { lessonId: { count, seconds } }
-  // ต้องดูคลิปจนจบก่อนจึงจะทำแบบทดสอบของบทนั้นได้ (ตามที่ออกแบบไว้แต่แรก) —
-  // เก็บเฉพาะช่วงเซสชันนี้เท่านั้น ยังไม่ได้ persist ลง Supabase ข้ามการ login
-  // ใหม่ (ต้องตัดสินใจเรื่อง schema ก่อน — ดูคอมเมนต์ที่ markVideoEnded)
+  // ต้องดูคลิปจนจบก่อนจึงจะทำแบบทดสอบของบทนั้นได้ (ตามที่ออกแบบไว้แต่แรก)
+  // Z3-8 — สถานะนี้ persist ลง Supabase แล้ว (ตาราง lms_lesson_state) และถูก
+  // rehydrate ตอน login จึงไม่ต้องเปิดคลิปซ้ำเมื่อกลับเข้าระบบใหม่
   const [videoWatched, setVideoWatched] = useState({});          // { [courseId]: { [lessonId]: true } }
   const [activeLesson, setActiveLesson] = useState(null);
   const [quizCtx, setQuizCtx] = useState(null);
   const [alert, setAlert] = useState(null);                     // watch-count alert
+  // Completion Record Framework §4.1 — the diagnostic result the learner is
+  // being asked to accept or retake, and the outcome once they decide.
+  const [diagnosticPending, setDiagnosticPending] = useState(null); // { attemptId, result, attemptNumber }
+  const [diagnosticAccepting, setDiagnosticAccepting] = useState(false);
+  const [diagnosticOutcome, setDiagnosticOutcome] = useState(null); // save-score's accept_diagnostic response
   // Set only when arriving via a Dashboard.tsx token handoff (never for a
   // direct-LINE-login session, which has no dashboardUrl param) — lets us
   // show a "back to dashboard" link without touching the direct-login path.
@@ -1385,7 +1588,23 @@ export default function Creatr365LMS() {
     // Fire-and-forget: fills in lessonStatus/lessonScores/courseProgress a
     // beat after the dashboard/course view first renders (locked-by-default
     // until this resolves) rather than blocking the login transition on it.
-    resolveProgress(s.id, courses).then(({ lessonStatus, lessonScores, courseProgress }) => {
+    resolveProgress(s.id, courses).then(({ lessonStatus, lessonScores, courseProgress, videoWatched, watchCounts }) => {
+      if (Object.keys(videoWatched || {}).length > 0) {
+        setVideoWatched(prev => ({ ...prev, ...videoWatched }));
+      }
+      if (Object.keys(watchCounts || {}).length > 0) {
+        // Rehydrate the per-lesson view counter so the "watched >5 times"
+        // support signal counts a learner's real total, not just this session.
+        setWatchData(prev => {
+          const next = { ...prev };
+          Object.values(watchCounts).forEach(byLesson => {
+            Object.entries(byLesson).forEach(([lessonId, count]) => {
+              next[lessonId] = { ...(next[lessonId] || {}), count };
+            });
+          });
+          return next;
+        });
+      }
       if (Object.keys(lessonStatus).length === 0) return;
       setLessonStatus(prev => ({ ...prev, ...lessonStatus }));
       setLessonScores(prev => ({ ...prev, ...lessonScores }));
@@ -1482,7 +1701,7 @@ export default function Creatr365LMS() {
     const course = COURSES[activeCourse];
     // สำคัญ: ต้องเซ็ต activeLesson ให้เป็น __pretest__ เพื่อให้ finishLessonQuiz รู้ว่าทำอะไรเสร็จ
     setActiveLesson({ id: "__pretest__", qg: "pretest" });
-    const qs = getQsByQG(course.pretestQGs, "Pre", course.pretestCount);
+    const qs = getQsByQG(course.pretestQGs, "Pre", course.pretestCount, `${course.id}|pretest`);
     setQuizCtx({ questions:qs, title:"Pre-test", threshold:0, quizType:"pretest", qg:course.pretestQGs.join(",") });
     setScreen("quiz");
   }
@@ -1542,7 +1761,7 @@ export default function Creatr365LMS() {
     apiSaveProgress(student?.id, activeCourse, lesson.id, "done");
   }
 
-  function handleQuizDone(result) {
+  async function handleQuizDone(result) {
     if (!result) { setScreen(activeCourse ? "course" : "dashboard"); return; }
 
     if (quizCtx.quizType === "pretest") {
@@ -1552,16 +1771,40 @@ export default function Creatr365LMS() {
       });
       apiSaveScore(student?.id, activeCourse, "pretest", quizCtx.qg, result.correct, result.total, result.pct, true);
       apiSaveProgress(student?.id, activeCourse, "__pretest__", "done");
+      // Z2.2 — also record it in Supabase so a returning learner is not made
+      // to sit the pre-test again on every login.
+      saveLessonState(student?.id, { action: "pretest", course_id: activeCourse });
       setScreen("course");
       return;
     }
 
-    // Knowledge Check / Diagnostic — only unlock the next lesson when the
-    // student actually meets this quiz's threshold (0 for Diagnostic, which
-    // never blocks; CFG.passThreshold for a real Knowledge Check). Used to
-    // call markLessonDone unconditionally here regardless of score, so a
-    // failed KC quiz still unlocked the next lesson — direct contradiction
-    // of "must pass the post-test to unlock, no skipping lessons". A failed
+    // Diagnostic — completing it always marks the (final) lesson done, since
+    // per the Completion Record Framework the diagnostic never gates lesson
+    // progress. What it DOES gate is the completion record: the learner must
+    // explicitly accept this score (or retake) before a record is issued —
+    // see DiagnosticReviewScreen below.
+    if (quizCtx.quizType === "diagnostic") {
+      markLessonDone(activeLesson, result.pct);
+      const radarBreakdown = buildRadar({ ...lessonScores[activeCourse], [activeLesson.id]: { qg: quizCtx.qg, pct: result.pct } });
+      const saveResult = await apiSaveScore(
+        student?.id, activeCourse, "diagnostic", quizCtx.qg,
+        result.correct, result.total, result.pct, true, activeLesson.id,
+        radarBreakdown,
+      );
+      setDiagnosticPending({
+        attemptId: saveResult?.diagnostic_attempt_id || null,
+        result,
+        attemptNumber: (diagnosticPending?.attemptNumber || 0) + 1,
+      });
+      setActiveLesson(null);
+      setScreen("diagnostic_review");
+      return;
+    }
+
+    // Knowledge Check — only unlock the next lesson when the student
+    // actually meets this quiz's threshold. A failed KC quiz used to still
+    // unlock the next lesson regardless of score — direct contradiction of
+    // "must pass the post-test to unlock, no skipping lessons". A failed
     // attempt is still logged (apiSaveScore below, passed=false) for the
     // audit trail, it just doesn't advance anything.
     const passed = quizCtx.threshold === 0 || result.pct >= quizCtx.threshold;
@@ -1571,6 +1814,35 @@ export default function Creatr365LMS() {
     apiSaveScore(student?.id, activeCourse, quizCtx.quizType, quizCtx.qg, result.correct, result.total, result.pct, passed, quizCtx.lessonId);
     setActiveLesson(null);
     setScreen("course");
+  }
+
+  // Learner pressed "ยืนยันรับผล" on the diagnostic review screen.
+  async function acceptDiagnostic() {
+    if (!diagnosticPending?.attemptId) { setScreen("course"); return; }
+    setDiagnosticAccepting(true);
+    const res = await acceptDiagnosticAttempt(student?.id, diagnosticPending.attemptId);
+    setDiagnosticAccepting(false);
+    setDiagnosticOutcome(res);
+  }
+
+  // Learner pressed "ทำแบบประเมินใหม่" — re-run the diagnostic with a fresh
+  // seed (Framework §4.2) rather than the identical question set.
+  function retakeDiagnostic() {
+    const course = COURSES[activeCourse];
+    const finalLesson = course.lessons[course.lessons.length - 1];
+    const attemptNumber = (diagnosticPending?.attemptNumber || 1) + 1;
+    const qs = getDiagnosticQuiz(course, attemptNumber);
+    setDiagnosticOutcome(null);
+    setActiveLesson(finalLesson);
+    setQuizCtx({
+      questions: qs,
+      title: "แบบประเมินวินิจฉัย (สอบใหม่)",
+      threshold: 0,
+      quizType: "diagnostic",
+      qg: finalLesson.qg,
+      lessonId: finalLesson.id,
+    });
+    setScreen("quiz");
   }
 
   // Session unlock (Onsite) — same isLast/diagnostic split as
@@ -1602,6 +1874,12 @@ export default function Creatr365LMS() {
       const cur = prev[lessonId] || { count:0, seconds:0 };
       const next = { count:cur.count+1, seconds:cur.seconds };
       apiSaveWatch(student?.id, activeCourse, lessonId, next.seconds, next.count);
+      // Z2.2 — the view counter used to go only to Apps Script, which is why
+      // /admin/students could never show "how many times did they reopen this
+      // lesson". It now also lands in Supabase where the admin screens read.
+      saveLessonState(student?.id, {
+        action: "video", course_id: activeCourse, lesson_id: lessonId, view: true,
+      });
       return { ...prev, [lessonId]:next };
     });
     if (newCount > CFG.maxWatchCount) {
@@ -1611,12 +1889,16 @@ export default function Creatr365LMS() {
   }
 
   // เรียกเมื่อผู้เล่นวิดีโอ (YouTube) ส่งสถานะ "จบคลิป" มาจริงๆ ผ่าน IFrame
-  // Player API — ปลดล็อกปุ่ม "ทำแบบทดสอบ" ของบทนั้น (เฉพาะเซสชันนี้)
+  // Player API — ปลดล็อกปุ่ม "ทำแบบทดสอบ" ของบทนั้น
+  // Z3-8 — บันทึกลง Supabase ด้วย (ไม่ await) เพื่อให้สถานะอยู่ข้ามการ login
   function markVideoEnded(lessonId) {
     setVideoWatched(prev => ({
       ...prev,
       [activeCourse]: { ...(prev[activeCourse] || {}), [lessonId]: true },
     }));
+    saveLessonState(student?.id, {
+      action: "video", course_id: activeCourse, lesson_id: lessonId, watched: true,
+    });
   }
 
   const activeCourseStatus = lessonStatus[activeCourse] || {};
@@ -1698,6 +1980,17 @@ export default function Creatr365LMS() {
           student={student}
           courseId={activeCourse}
           onDone={handleQuizDone}
+        />
+      )}
+
+      {screen==="diagnostic_review" && diagnosticPending && (
+        <DiagnosticReviewScreen
+          pending={diagnosticPending}
+          accepting={diagnosticAccepting}
+          outcome={diagnosticOutcome}
+          onAccept={acceptDiagnostic}
+          onRetake={retakeDiagnostic}
+          onDone={()=>{ setDiagnosticPending(null); setDiagnosticOutcome(null); setScreen("results"); }}
         />
       )}
 
