@@ -235,15 +235,32 @@ function seededShuffle(arr, seed) {
 }
 
 function getQsByQG(qgs, phase, count, seed) {
-  // Z2.2 — the pre-test used to take the first N questions straight off the
-  // bank in file order, so every learner on a course saw an identical,
-  // easily-shared list. It now uses the same deterministic shuffle as the
-  // Knowledge Checks: different learners/courses get different orders, while
-  // the *same* learner retaking the same pre-test still sees the same set
-  // (fair, and reproducible for support).
-  const pool = QUIZ_BANK.filter(q => qgs.includes(q.qg) && q.phase === phase);
-  const ordered = seed ? seededShuffle(pool, seed) : pool;
-  return count ? ordered.slice(0, count) : ordered;
+  // 2569-09-21 — two bugs fixed here, both confirmed against real data
+  // (SIGNAL's pretest: pretestQGs ["QG-01","QG-03","QG-04"], count 15):
+  //
+  // 1. This used to shuffle *one merged pool* of every qg and slice the
+  //    top N, which never guaranteed each QG got a share — with the old
+  //    81-question bank it was even worse: no shuffle at all
+  //    (`.slice(0, count)` straight off file order), so SIGNAL's pretest
+  //    deterministically returned QG-01=9, QG-03=6, QG-04=0 every single
+  //    time, for every learner. Now allocates an even ceil(count/qgs.length)
+  //    share to *each* QG independently before combining, same pattern as
+  //    getDiagnosticQuiz already used below.
+  // 2. The seed passed in from startPretest() was `${course.id}|pretest`
+  //    only — no per-learner component — so despite the comment this
+  //    replaced claiming "different learners... get different orders",
+  //    every learner on the same course saw the exact same shuffled set.
+  //    Callers now pass the student id as part of the seed (see
+  //    startPretest) so `seededShuffle` actually varies per learner too.
+  const perQg = Math.max(1, Math.ceil(count / qgs.length));
+  const picked = [];
+  qgs.forEach(qg => {
+    const pool = QUIZ_BANK.filter(q => q.qg === qg && q.phase === phase);
+    if (!pool.length) return;
+    const ordered = seed ? seededShuffle(pool, `${seed}|${qg}`) : pool;
+    picked.push(...ordered.slice(0, perQg));
+  });
+  return count ? picked.slice(0, count) : picked;
 }
 
 // หยิบ `count` ข้อจาก arr แบบต่อคิว วนกลับไปต้นได้ถ้าคิวไม่พอ (ยังกำหนดแน่นอนเสมอ)
@@ -1701,7 +1718,7 @@ export default function Creatr365LMS() {
     const course = COURSES[activeCourse];
     // สำคัญ: ต้องเซ็ต activeLesson ให้เป็น __pretest__ เพื่อให้ finishLessonQuiz รู้ว่าทำอะไรเสร็จ
     setActiveLesson({ id: "__pretest__", qg: "pretest" });
-    const qs = getQsByQG(course.pretestQGs, "Pre", course.pretestCount, `${course.id}|pretest`);
+    const qs = getQsByQG(course.pretestQGs, "Pre", course.pretestCount, `${course.id}|pretest|${student?.id ?? "anon"}`);
     setQuizCtx({ questions:qs, title:"Pre-test", threshold:0, quizType:"pretest", qg:course.pretestQGs.join(",") });
     setScreen("quiz");
   }
