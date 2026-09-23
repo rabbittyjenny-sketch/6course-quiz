@@ -409,6 +409,11 @@ async function saveScoreToSupabase(params, attempt = 1) {
         passed: params.passed === true || params.passed === "true",
         quiz_type: params.quiz_type || "",
         radar_breakdown: params.radar_breakdown || undefined,
+        // Kept in quiz_attempts (append-only) so every try — including a
+        // failed Knowledge Check and the pre-test baseline — stays auditable.
+        correct: typeof params.raw === "number" ? params.raw : undefined,
+        total: typeof params.total === "number" ? params.total : undefined,
+        qg: params.qg || undefined,
       }),
     });
     const body = await res.json().catch(() => null);
@@ -452,7 +457,9 @@ async function api(params) {
   }
 
   let saveResult = null;
-  if (params.action === "save_score" && params.sid && params.lesson_id) {
+  // The pre-test has no lesson_id (it is course-level); it used to be skipped
+  // here, so its baseline score was never stored anywhere.
+  if (params.action === "save_score" && params.sid && (params.lesson_id || params.quiz_type === "pretest")) {
     saveResult = await saveScoreToSupabase(params);
   }
   return params.action === "save_score" ? saveResult : legacyResult;
@@ -557,7 +564,7 @@ function saveLessonState(studentId, payload) {
 }
 
 async function resolveProgress(studentId, enrolledCourseIds) {
-  const empty = { lessonStatus: {}, lessonScores: {}, courseProgress: {}, videoWatched: {}, watchCounts: {} };
+  const empty = { lessonStatus: {}, lessonScores: {}, courseProgress: {}, videoWatched: {}, watchCounts: {}, pendingDiagnostics: {} };
   // Both calls are independent; run them together so login stays fast.
   const [progressRes, lessonState] = await Promise.all([
     fetch(SUPABASE_GET_PROGRESS_URL, {
@@ -589,8 +596,17 @@ async function resolveProgress(studentId, enrolledCourseIds) {
   try {
     const res = progressRes;
     if (!res || !res.ok) return { ...empty, videoWatched, watchCounts, lessonStatus: pretestToStatus(pretestDone) };
-    const { progress } = await res.json();
+    const { progress, pending_diagnostics } = await res.json();
     if (!progress) return { ...empty, videoWatched, watchCounts, lessonStatus: pretestToStatus(pretestDone) };
+
+    // A diagnostic result the learner never answered ("ยืนยันรับผล" /
+    // "ทำแบบประเมินใหม่") — e.g. the tab was closed on the review screen.
+    // Keyed by LMS course id; the review screen is reopened for it below.
+    const pendingDiagnostics = {};
+    Object.entries(pending_diagnostics || {}).forEach(([slug, p]) => {
+      const courseId = SLUG_TO_LMS[slug];
+      if (courseId && enrolledCourseIds.includes(courseId) && p?.attempt_id) pendingDiagnostics[courseId] = p;
+    });
 
     const lessonStatus = pretestToStatus(pretestDone);
     const lessonScores = {};
@@ -622,7 +638,7 @@ async function resolveProgress(studentId, enrolledCourseIds) {
       }
     });
 
-    return { lessonStatus, lessonScores, courseProgress, videoWatched, watchCounts };
+    return { lessonStatus, lessonScores, courseProgress, videoWatched, watchCounts, pendingDiagnostics };
   } catch (e) {
     console.error("[get-progress]", e);
     return { ...empty, videoWatched, watchCounts, lessonStatus: pretestToStatus(pretestDone) };
@@ -1360,8 +1376,9 @@ function QuizEngine({ questions, title, threshold, courseId, quizType, qg, stude
 // learner — not the system — decides whether this score becomes the one that
 // backs their completion record for the course, and a completion record is
 // never issued without that explicit decision.
-function DiagnosticReviewScreen({ pending, accepting, outcome, onAccept, onRetake, onDone }) {
+function DiagnosticReviewScreen({ pending, accepting, outcome, error, onAccept, onRetake, onDone }) {
   const { result } = pending;
+  const canAccept = !!pending.attemptId;
 
   // After acceptDiagnosticAttempt() has answered:
   if (outcome) {
@@ -1401,7 +1418,16 @@ function DiagnosticReviewScreen({ pending, accepting, outcome, onAccept, onRetak
       <div style={S.card}>
         <div style={{ textAlign:"center", padding:"14px 0" }}>
           <div style={{ fontSize:28, fontWeight:700, marginBottom:4 }}>{result.pct}%</div>
-          <div style={S.muted}>{result.correct} จาก {result.total} ข้อ — แบบประเมินวินิจฉัย</div>
+          <div style={S.muted}>
+            {typeof result.total === "number" && result.total > 0
+              ? <>{result.correct} จาก {result.total} ข้อ — แบบประเมินวินิจฉัย</>
+              : <>แบบประเมินวินิจฉัย ครั้งที่ {pending.attemptNumber}</>}
+          </div>
+          {pending.resumedAt && (
+            <div style={{ ...S.muted, marginTop:8 }}>
+              ผลนี้ทำไว้เมื่อ {new Date(pending.resumedAt).toLocaleString("th-TH", { dateStyle:"medium", timeStyle:"short" })} และยังไม่ได้เลือก — กรุณายืนยันหรือทำใหม่ก่อนเรียนต่อ
+            </div>
+          )}
         </div>
         <hr style={S.divider} />
         <div style={{ fontSize:14, lineHeight:1.7, marginBottom:16 }}>
@@ -1412,10 +1438,18 @@ function DiagnosticReviewScreen({ pending, accepting, outcome, onAccept, onRetak
           <button onClick={onRetake} disabled={accepting} style={{ ...S.btnOut, flex:1 }}>
             ทำแบบประเมินใหม่
           </button>
-          <button onClick={onAccept} disabled={accepting} style={{ ...S.btn, flex:1 }}>
-            {accepting ? "กำลังบันทึก..." : "ยืนยันรับผลนี้"}
-          </button>
+          {canAccept && (
+            <button onClick={onAccept} disabled={accepting} style={{ ...S.btn, flex:1 }}>
+              {accepting ? "กำลังบันทึก..." : "ยืนยันรับผลนี้"}
+            </button>
+          )}
         </div>
+        {!canAccept && (
+          <div style={{ ...S.muted, color:"#C0392B", marginTop:12 }}>
+            ระบบบันทึกผลครั้งนี้ไม่สำเร็จ จึงยืนยันผลนี้ไม่ได้ — กรุณากด "ทำแบบประเมินใหม่"
+          </div>
+        )}
+        {error && <div style={{ ...S.muted, color:"#C0392B", marginTop:12 }}>{error}</div>}
       </div>
     </div>
   );
@@ -1576,6 +1610,10 @@ export default function Creatr365LMS() {
   const [diagnosticPending, setDiagnosticPending] = useState(null); // { attemptId, result, attemptNumber }
   const [diagnosticAccepting, setDiagnosticAccepting] = useState(false);
   const [diagnosticOutcome, setDiagnosticOutcome] = useState(null); // save-score's accept_diagnostic response
+  const [diagnosticError, setDiagnosticError] = useState("");
+  // Unanswered diagnostic attempts from the server, by course id — see
+  // resolveProgress. Drives reopening the review screen on course entry.
+  const [pendingDiagnostics, setPendingDiagnostics] = useState({});
   // Set only when arriving via a Dashboard.tsx token handoff (never for a
   // direct-LINE-login session, which has no dashboardUrl param) — lets us
   // show a "back to dashboard" link without touching the direct-login path.
@@ -1616,7 +1654,8 @@ export default function Creatr365LMS() {
     // Fire-and-forget: fills in lessonStatus/lessonScores/courseProgress a
     // beat after the dashboard/course view first renders (locked-by-default
     // until this resolves) rather than blocking the login transition on it.
-    resolveProgress(s.id, courses).then(({ lessonStatus, lessonScores, courseProgress, videoWatched, watchCounts }) => {
+    resolveProgress(s.id, courses).then(({ lessonStatus, lessonScores, courseProgress, videoWatched, watchCounts, pendingDiagnostics }) => {
+      if (Object.keys(pendingDiagnostics || {}).length > 0) setPendingDiagnostics(pendingDiagnostics);
       if (Object.keys(videoWatched || {}).length > 0) {
         setVideoWatched(prev => ({ ...prev, ...videoWatched }));
       }
@@ -1715,6 +1754,7 @@ export default function Creatr365LMS() {
   function handleLogout() {
     setStudent(null); setEnrolledCourses([]); setCourseProgress({});
     setActiveCourse(null); setLessonStatus({}); setLessonScores({});
+    setPendingDiagnostics({}); setDiagnosticPending(null); setDiagnosticOutcome(null);
     setScreen("login");
   }
 
@@ -1803,7 +1843,12 @@ export default function Creatr365LMS() {
   }
 
   async function handleQuizDone(result) {
-    if (!result) { setScreen(activeCourse ? "course" : "dashboard"); return; }
+    if (!result) {
+      // Leaving a diagnostic retake part-way must not skip the decision.
+      if (quizCtx?.quizType === "diagnostic" && diagnosticPending) { setScreen("diagnostic_review"); return; }
+      setScreen(activeCourse ? "course" : "dashboard");
+      return;
+    }
 
     if (quizCtx.quizType === "pretest") {
       setLessonStatus(prev => {
@@ -1859,21 +1904,54 @@ export default function Creatr365LMS() {
 
   // Learner pressed "ยืนยันรับผล" on the diagnostic review screen.
   async function acceptDiagnostic() {
-    if (!diagnosticPending?.attemptId) { setScreen("course"); return; }
+    const current = diagnosticPending || resumedPending;
+    if (!current?.attemptId) return; // review screen hides the button in this case
     setDiagnosticAccepting(true);
-    const res = await acceptDiagnosticAttempt(student?.id, diagnosticPending.attemptId);
+    setDiagnosticError("");
+    const res = await acceptDiagnosticAttempt(student?.id, current.attemptId);
     setDiagnosticAccepting(false);
+    if (!res || res.error) {
+      // Network/server failure: nothing was decided, so stay on the prompt
+      // (and keep it pending server-side) instead of pretending it saved.
+      setDiagnosticError("บันทึกไม่สำเร็จ กรุณาตรวจสอบอินเทอร์เน็ตแล้วกด \"ยืนยันรับผลนี้\" อีกครั้ง");
+      return;
+    }
+    setDiagnosticPending(current);
+    setPendingDiagnostics(prev => { const next = { ...prev }; delete next[activeCourse]; return next; });
     setDiagnosticOutcome(res);
+    setScreen("diagnostic_review");
   }
+
+  // Standard "resume the unfinished step" behaviour: if the server still
+  // holds an unanswered diagnostic attempt for the course being opened, the
+  // course screen is replaced by its accept/retake prompt — on any device,
+  // after any logout — until the learner actually chooses (Framework §4.1).
+  // Derived at render time rather than copied into state by an effect.
+  const serverPending = screen === "course" && activeCourse && !diagnosticPending
+    ? pendingDiagnostics[activeCourse] : null;
+  const resumedPending = serverPending ? {
+    attemptId: serverPending.attempt_id,
+    attemptNumber: serverPending.attempt_number || 1,
+    result: { pct: serverPending.score_pct, correct: null, total: null },
+    resumedAt: serverPending.created_at || null,
+  } : null;
 
   // Learner pressed "ทำแบบประเมินใหม่" — re-run the diagnostic with a fresh
   // seed (Framework §4.2) rather than the identical question set.
   function retakeDiagnostic() {
     const course = COURSES[activeCourse];
     const finalLesson = course.lessons[course.lessons.length - 1];
-    const attemptNumber = (diagnosticPending?.attemptNumber || 1) + 1;
+    const current = diagnosticPending || resumedPending;
+    const attemptNumber = (current?.attemptNumber || 1) + 1;
+    // Carry the attempt being replaced so the new result is numbered after
+    // it, and so leaving the retake half-way returns to this same prompt.
+    setDiagnosticPending(current);
     const qs = getDiagnosticQuiz(course, attemptNumber);
     setDiagnosticOutcome(null);
+    setDiagnosticError("");
+    // Keep the server-side pending attempt: if this retake is abandoned
+    // too, the previous unanswered result is what reopens next time.
+    setPendingDiagnostics(prev => { const next = { ...prev }; delete next[activeCourse]; return next; });
     setActiveLesson(finalLesson);
     setQuizCtx({
       questions: qs,
@@ -1987,7 +2065,7 @@ export default function Creatr365LMS() {
         />
       )}
 
-      {screen==="course" && activeCourse && (
+      {screen==="course" && activeCourse && !resumedPending && (
         <CourseView
           courseId={activeCourse}
           student={student}
@@ -2024,11 +2102,12 @@ export default function Creatr365LMS() {
         />
       )}
 
-      {screen==="diagnostic_review" && diagnosticPending && (
+      {((screen==="diagnostic_review" && diagnosticPending) || resumedPending) && (
         <DiagnosticReviewScreen
-          pending={diagnosticPending}
+          pending={resumedPending || diagnosticPending}
           accepting={diagnosticAccepting}
           outcome={diagnosticOutcome}
+          error={diagnosticError}
           onAccept={acceptDiagnostic}
           onRetake={retakeDiagnostic}
           onDone={()=>{ setDiagnosticPending(null); setDiagnosticOutcome(null); setScreen("results"); }}
